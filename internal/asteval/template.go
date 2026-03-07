@@ -69,6 +69,20 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 				pkgPath := templatePkgPath(typesInfo, x)
 				t, err := parseFiles(ts, pkgPath, fm, lDelim, rDelim, filePaths...)
 				return t, lDelim, rDelim, err
+			case "ParseFiles":
+				filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+				if err != nil {
+					return nil, lDelim, rDelim, err
+				}
+				t, err := parseFiles(ts, "", fm, lDelim, rDelim, filePaths...)
+				return t, lDelim, rDelim, err
+			case "ParseGlob":
+				filePaths, err := evaluateParseGlobArgs(workingDirectory, fileSet, call)
+				if err != nil {
+					return nil, lDelim, rDelim, err
+				}
+				t, err := parseFiles(ts, "", fm, lDelim, rDelim, filePaths...)
+				return t, lDelim, rDelim, err
 			case "Parse":
 				if len(call.Args) != 1 {
 					return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("expected exactly one string literal argument"))
@@ -134,6 +148,20 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			}
 			t, err := parseFiles(nil, pkgPath, fm, lDelim, rDelim, filePaths...)
 			return t, lDelim, rDelim, err
+		case "ParseFiles":
+			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+			if err != nil {
+				return nil, lDelim, rDelim, err
+			}
+			t, err := parseFiles(nil, pkgPath, fm, lDelim, rDelim, filePaths...)
+			return t, lDelim, rDelim, err
+		case "ParseGlob":
+			filePaths, err := evaluateParseGlobArgs(workingDirectory, fileSet, call)
+			if err != nil {
+				return nil, lDelim, rDelim, err
+			}
+			t, err := parseFiles(nil, pkgPath, fm, lDelim, rDelim, filePaths...)
+			return t, lDelim, rDelim, err
 		default:
 			return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, call.Fun.Pos(), fmt.Errorf("unsupported function %s", sel.Sel.Name))
 		}
@@ -183,6 +211,20 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			}
 			if meta != nil {
 				meta.EmbedFilePaths = append(meta.EmbedFilePaths, filePaths...)
+			}
+			t, err := parseFiles(up, "", fm, upLDelim, upRDelim, filePaths...)
+			return t, upLDelim, upRDelim, err
+		case "ParseFiles":
+			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+			if err != nil {
+				return nil, upLDelim, upRDelim, err
+			}
+			t, err := parseFiles(up, "", fm, upLDelim, upRDelim, filePaths...)
+			return t, upLDelim, upRDelim, err
+		case "ParseGlob":
+			filePaths, err := evaluateParseGlobArgs(workingDirectory, fileSet, call)
+			if err != nil {
+				return nil, upLDelim, upRDelim, err
 			}
 			t, err := parseFiles(up, "", fm, upLDelim, upRDelim, filePaths...)
 			return t, upLDelim, upRDelim, err
@@ -432,6 +474,43 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 		}
 	}
 	return joinFilePaths(workingDirectory, filtered...), nil
+}
+
+func evaluateParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr) ([]string, error) {
+	if len(call.Args) < 1 {
+		return nil, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("missing required arguments"))
+	}
+	filePaths, err := StringLiteralExpressionList(workingDirectory, fileSet, call.Args)
+	if err != nil {
+		return nil, err
+	}
+	for i, fp := range filePaths {
+		if !filepath.IsAbs(fp) {
+			filePaths[i] = filepath.Join(workingDirectory, fp)
+		}
+	}
+	return filePaths, nil
+}
+
+func evaluateParseGlobArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr) ([]string, error) {
+	if len(call.Args) != 1 {
+		return nil, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("expected exactly one string literal argument"))
+	}
+	pattern, err := StringLiteralExpression(workingDirectory, fileSet, call.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if !filepath.IsAbs(pattern) {
+		pattern = filepath.Join(workingDirectory, pattern)
+	}
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[0].Pos(), fmt.Errorf("bad pattern %q: %w", pattern, err))
+	}
+	if len(matches) == 0 {
+		return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[0].Pos(), fmt.Errorf("pattern %q matched no files", pattern))
+	}
+	return matches, nil
 }
 
 func embedFSFilePaths(dir string, fileSet *token.FileSet, files []*ast.File, exp ast.Expr, embeddedFiles []string) ([]string, error) {

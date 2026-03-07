@@ -16,6 +16,22 @@ Flags:
 - `-C dir` &mdash; change working directory before loading packages
 - `-o format` &mdash; output format: `tsv` (default) or `jsonl`
 
+### How the CLI discovers templates
+
+The CLI works by statically analyzing your Go source code. It traces each `ExecuteTemplate` call back to the variable that holds the `*template.Template`, then follows that variable's initialization chain to find the template files. This means:
+
+1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression are skipped.
+
+2. **Template initialization must use static arguments.** File paths passed to `ParseFiles`, glob patterns passed to `ParseGlob`, and embed patterns passed to `ParseFS` must all be string literals.
+
+3. **Supported initialization patterns:**
+   - `template.Must(template.ParseFiles("a.html", "b.html"))`
+   - `template.Must(template.ParseGlob("templates/*.html"))`
+   - `template.Must(template.ParseFS(fs, "*.html"))`
+   - `template.New("name").ParseFiles("a.html")`
+   - Chained calls: `.Funcs(...)`, `.Option(...)`, `.Delims(...)`, `.Parse(...)`
+   - Additional `.ParseFiles(...)`, `.ParseGlob(...)`, or `.ParseFS(...)` calls on an already-initialized template variable
+
 ## Library usage
 
 Call `Execute` with a `types.Type` for the template's data (`.`) and the template's `parse.Tree`. See [example_test.go](./example_test.go) for a working example.
