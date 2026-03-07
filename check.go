@@ -42,6 +42,10 @@ func (e *Error) Unwrap() error {
 	return e.err
 }
 
+// WarningFunc is called when a non-fatal issue is detected during
+// type-checking, such as field access on an interface type.
+type WarningFunc func(tree *parse.Tree, node parse.Node, message string)
+
 type Global struct {
 	trees TreeFinder
 	calls CallChecker
@@ -52,6 +56,7 @@ type Global struct {
 
 	InspectTemplateNode TemplateNodeInspectorFunc
 	InspectCallNode     ExecuteTemplateNodeInspectorFunc
+	Warn                WarningFunc
 
 	// Qualifier controls how types are printed in error messages.
 	// If nil, types are printed with their full package path.
@@ -452,6 +457,13 @@ func (s *scope) checkIdentifiers(tree *parse.Tree, dot types.Type, n parse.Node,
 			}
 			obj, _, _ := types.LookupFieldOrMethod(x, true, s.global.pkg, ident)
 			if obj == nil {
+				if types.IsInterface(x) {
+					if s.global.Warn != nil {
+						s.global.Warn(tree, n, fmt.Sprintf("field access .%s on interface type %s cannot be statically verified", ident, s.global.TypeString(x)))
+					}
+					x = types.NewInterfaceType(nil, nil)
+					continue
+				}
 				return nil, newError(tree, n, "%s not found on %s", ident, s.global.TypeString(x))
 			}
 			switch o := obj.(type) {

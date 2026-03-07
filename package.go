@@ -7,6 +7,8 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"text/template/parse"
 
 	"golang.org/x/tools/go/packages"
@@ -30,15 +32,20 @@ type resolvedTemplate struct {
 
 type ExecuteTemplateNodeInspectorFunc func(node *ast.CallExpr, t *parse.Tree, tp types.Type)
 
+// PackageWarningFunc is called when a non-fatal issue is detected, such as
+// field access on an interface type that cannot be statically verified.
+type PackageWarningFunc func(pos token.Position, message string)
+
 // Package discovers all .ExecuteTemplate calls in the given package,
 // resolves receiver variables to their template construction chains,
 // and type-checks each call.
 //
 // ExecuteTemplate must be called with a string literal for the second parameter.
-func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc) error {
+// If warn is non-nil, it is called for non-fatal issues such as interface field access.
+func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	pending, receivers := findExecuteCalls(pkg)
 	resolved, resolveErrs := resolveTemplates(pkg, receivers)
-	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate)
+	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate, warn)
 	return errors.Join(append(resolveErrs, callErr)...)
 }
 
@@ -215,7 +222,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 
 // checkCalls type-checks each pending ExecuteTemplate call against its
 // resolved template.
-func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc) error {
+func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	mergedFunctions := make(Functions)
 	if pkg.Types != nil {
 		mergedFunctions = DefaultFunctions(pkg.Types)
@@ -238,6 +245,12 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		}
 		global := NewGlobal(pkg.Types, pkg.Fset, rt.templates, mergedFunctions)
 		global.InspectTemplateNode = inspectTemplate
+		if warn != nil {
+			global.Warn = func(tree *parse.Tree, node parse.Node, message string) {
+				loc, _ := tree.ErrorContext(node)
+				warn(parseLocation(loc), message)
+			}
+		}
 		if inspectCall != nil {
 			inspectCall(p.call, looked.Tree(), p.dataType)
 		}
@@ -254,4 +267,19 @@ func packageDirectory(pkg *packages.Package) string {
 		return filepath.Dir(pkg.GoFiles[0])
 	}
 	return "."
+}
+
+// parseLocation parses a "filename:line:col" string into a token.Position.
+func parseLocation(loc string) token.Position {
+	var pos token.Position
+	if i := strings.LastIndex(loc, ":"); i >= 0 {
+		pos.Column, _ = strconv.Atoi(loc[i+1:])
+		loc = loc[:i]
+	}
+	if i := strings.LastIndex(loc, ":"); i >= 0 {
+		pos.Line, _ = strconv.Atoi(loc[i+1:])
+		loc = loc[:i]
+	}
+	pos.Filename = loc
+	return pos
 }
