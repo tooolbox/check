@@ -8,6 +8,8 @@ import (
 	"go/types"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"text/template/parse"
 
 	"golang.org/x/tools/go/packages"
@@ -306,6 +308,12 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		}
 		global := NewGlobal(pkg.Types, pkg.Fset, rt.templates, mergedFunctions)
 		global.InspectTemplateNode = wrappedInspect
+		if warn != nil {
+			global.Warn = func(cat WarningCategory, tree *parse.Tree, node parse.Node, message string) {
+				loc, _ := tree.ErrorContext(node)
+				warn(cat, parseLocation(loc), message)
+			}
+		}
 		if inspectCall != nil {
 			inspectCall(p.call, looked.Tree(), p.dataType)
 		}
@@ -348,4 +356,19 @@ func packageDirectory(pkg *packages.Package) string {
 		return filepath.Dir(pkg.GoFiles[0])
 	}
 	return "."
+}
+
+// parseLocation parses a "filename:line:col" string into a token.Position.
+func parseLocation(loc string) token.Position {
+	var pos token.Position
+	if i := strings.LastIndex(loc, ":"); i >= 0 {
+		pos.Column, _ = strconv.Atoi(loc[i+1:])
+		loc = loc[:i]
+	}
+	if i := strings.LastIndex(loc, ":"); i >= 0 {
+		pos.Line, _ = strconv.Atoi(loc[i+1:])
+		loc = loc[:i]
+	}
+	pos.Filename = loc
+	return pos
 }
