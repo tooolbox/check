@@ -42,6 +42,10 @@ func (e *Error) Unwrap() error {
 	return e.err
 }
 
+// WarningFunc is called when a non-fatal issue is detected during
+// type-checking, such as pointer dereference without a nil guard.
+type WarningFunc func(tree *parse.Tree, node parse.Node, message string)
+
 type Global struct {
 	trees TreeFinder
 	calls CallChecker
@@ -52,6 +56,7 @@ type Global struct {
 
 	InspectTemplateNode TemplateNodeInspectorFunc
 	InspectCallNode     ExecuteTemplateNodeInspectorFunc
+	Warn                WarningFunc
 
 	// Qualifier controls how types are printed in error messages.
 	// If nil, types are printed with their full package path.
@@ -108,14 +113,16 @@ func Execute(global *Global, tree *parse.Tree, data types.Type) error {
 }
 
 type scope struct {
-	global    *Global
-	variables map[string]types.Type
+	global     *Global
+	variables  map[string]types.Type
+	dotGuarded bool // true when inside {{with}} or {{if}} that tested dot
 }
 
 func (s *scope) child() *scope {
 	return &scope{
-		global:    s.global,
-		variables: maps.Clone(s.variables),
+		global:     s.global,
+		variables:  maps.Clone(s.variables),
+		dotGuarded: s.dotGuarded,
 	}
 }
 
@@ -221,6 +228,7 @@ func (s *scope) checkIfNode(tree *parse.Tree, dot types.Type, n *parse.IfNode) e
 		return err
 	}
 	ifScope := s.child()
+	ifScope.dotGuarded = true
 	if _, err := ifScope.walk(tree, dot, nil, n.List); err != nil {
 		return err
 	}
@@ -240,6 +248,7 @@ func (s *scope) checkWithNode(tree *parse.Tree, dot types.Type, n *parse.WithNod
 		return err
 	}
 	withScope := child.child()
+	withScope.dotGuarded = true
 	if _, err := withScope.walk(tree, x, nil, n.List); err != nil {
 		return err
 	}
@@ -423,6 +432,9 @@ func (s *scope) notAFunction(tree *parse.Tree, node parse.Node, args []parse.Nod
 func (s *scope) checkIdentifiers(tree *parse.Tree, dot types.Type, n parse.Node, idents []string, args []types.Type) (types.Type, error) {
 	x := dot
 	for i, ident := range idents {
+		if _, isPtr := x.(*types.Pointer); isPtr && !s.dotGuarded && s.global.Warn != nil {
+			s.global.Warn(tree, n, fmt.Sprintf("accessing .%s on pointer type %s may panic if nil; consider guarding with {{with}} or {{if}}", ident, s.global.TypeString(x)))
+		}
 		x = dereference(x)
 		switch xx := x.(type) {
 		case *types.Map:
