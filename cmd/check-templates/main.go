@@ -30,11 +30,13 @@ func main() {
 func run(dir string, args []string, stdout, stderr io.Writer) int {
 	var (
 		verbose      bool
+		warn         bool
 		outputFormat string
 	)
 
 	flagSet := flag.NewFlagSet("check-templates", flag.ContinueOnError)
 	flagSet.BoolVar(&verbose, "v", false, "show all calls")
+	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unused templates)")
 	flagSet.StringVar(&dir, "C", dir, "change directory")
 	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv or jsonl")
 	if err := flagSet.Parse(args); err != nil {
@@ -82,7 +84,14 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 		}, func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
 			loc, _ := t.ErrorContext(node)
 			writeCall(parseLocation(loc), t.Name, tp)
-		}); err != nil {
+		}, func() check.WarningFunc {
+			if !warn {
+				return nil
+			}
+			return func(pos token.Position, message string) {
+				_, _ = fmt.Fprintf(stderr, "warning: %s: %s\n", pos, message)
+			}
+		}()); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			exitCode = 1
 		}
