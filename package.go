@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"sort"
 	"text/template/parse"
 
 	"golang.org/x/tools/go/packages"
@@ -60,12 +61,12 @@ type PackageWarningFunc func(category WarningCategory, pos token.Position, messa
 // and type-checks each call.
 //
 // ExecuteTemplate must be called with a string literal for the second parameter.
-// If warn is non-nil, it is called for ExecuteTemplate calls that use a
-// non-static string for the template name argument.
+// If warn is non-nil, it is called for non-fatal issues such as unused templates
+// or unguarded pointer access.
 func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	pending, receivers := findExecuteCalls(pkg, warn)
 	resolved, resolveErrs := resolveTemplates(pkg, receivers)
-	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate)
+	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate, warn)
 	return errors.Join(append(resolveErrs, callErr)...)
 }
 
@@ -246,7 +247,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 
 // checkCalls type-checks each pending ExecuteTemplate call against its
 // resolved template.
-func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc) error {
+func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	mergedFunctions := make(Functions)
 	if pkg.Types != nil {
 		mergedFunctions = DefaultFunctions(pkg.Types)
@@ -255,6 +256,35 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		for name, sig := range rt.functions {
 			mergedFunctions[name] = sig
 		}
+	}
+
+	// Track all referenced template names for unused detection.
+	referenced := make(map[types.Object]map[string]struct{})
+
+	// Wrap the user's inspectTemplate callback to also track {{template "name"}} references.
+	var wrappedInspect TemplateNodeInspectorFunc
+	if warn != nil {
+		wrappedInspect = func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
+			// Find which receiver this tree belongs to and record the reference.
+			for _, p := range pending {
+				rt, ok := resolved[p.receiverObj]
+				if !ok {
+					continue
+				}
+				if _, found := rt.templates.FindTree(node.Name); found {
+					if referenced[p.receiverObj] == nil {
+						referenced[p.receiverObj] = make(map[string]struct{})
+					}
+					referenced[p.receiverObj][node.Name] = struct{}{}
+					break
+				}
+			}
+			if inspectTemplate != nil {
+				inspectTemplate(node, t, tp)
+			}
+		}
+	} else {
+		wrappedInspect = inspectTemplate
 	}
 
 	var errs []error
@@ -267,13 +297,46 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		if looked == nil {
 			continue
 		}
+		// Record the ExecuteTemplate target as referenced.
+		if warn != nil {
+			if referenced[p.receiverObj] == nil {
+				referenced[p.receiverObj] = make(map[string]struct{})
+			}
+			referenced[p.receiverObj][p.templateName] = struct{}{}
+		}
 		global := NewGlobal(pkg.Types, pkg.Fset, rt.templates, mergedFunctions)
-		global.InspectTemplateNode = inspectTemplate
+		global.InspectTemplateNode = wrappedInspect
 		if inspectCall != nil {
 			inspectCall(p.call, looked.Tree(), p.dataType)
 		}
 		if err := Execute(global, looked.Tree(), p.dataType); err != nil {
 			errs = append(errs, err)
+		}
+	}
+
+	// Warn about unused templates.
+	if warn != nil {
+		for obj, rt := range resolved {
+			refs := referenced[obj]
+			names := rt.templates.TemplateNames()
+			sort.Strings(names)
+			for _, name := range names {
+				if name == "" {
+					continue
+				}
+				// Skip templates with no content (e.g. the root template
+				// created by template.New("name") that serves as a container).
+				if tree, ok := rt.templates.FindTree(name); !ok || tree == nil || tree.Root == nil || len(tree.Root.Nodes) == 0 {
+					continue
+				}
+				if refs != nil {
+					if _, ok := refs[name]; ok {
+						continue
+					}
+				}
+				pos := pkg.Fset.Position(obj.Pos())
+				warn(WarnUnusedTemplate, pos, fmt.Sprintf("template %q is defined but never referenced", name))
+			}
 		}
 	}
 

@@ -29,6 +29,7 @@ type Template interface {
 	AddParseTree(name string, tree *parse.Tree) (Template, error)
 	Tree() *parse.Tree
 	FindTree(name string) (*parse.Tree, bool)
+	TemplateNames() []string
 }
 
 // TemplateMetadata accumulates metadata during template evaluation.

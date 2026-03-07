@@ -36,7 +36,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 
 	flagSet := flag.NewFlagSet("check-templates", flag.ContinueOnError)
 	flagSet.BoolVar(&verbose, "v", false, "show all calls")
-	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unguarded pointer access)")
+	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unguarded pointer access, unused templates)")
 	flagSet.StringVar(&dir, "C", dir, "change directory")
 	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv or jsonl")
 	if err := flagSet.Parse(args); err != nil {
