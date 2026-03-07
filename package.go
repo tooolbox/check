@@ -30,9 +30,30 @@ type resolvedTemplate struct {
 
 type ExecuteTemplateNodeInspectorFunc func(node *ast.CallExpr, t *parse.Tree, tp types.Type)
 
-// WarningFunc is called when a non-fatal issue is detected, such as
-// an ExecuteTemplate call with a non-static string for the template name.
-type WarningFunc func(pos token.Position, message string)
+// WarningCategory identifies the kind of warning.
+type WarningCategory int
+
+const (
+	// WarnNonStaticTemplateName indicates an ExecuteTemplate call with a
+	// non-static string for the template name.
+	WarnNonStaticTemplateName WarningCategory = iota + 1
+
+	// WarnUnusedTemplate indicates a template that is defined but never
+	// referenced by any ExecuteTemplate call or {{template}} action.
+	WarnUnusedTemplate
+
+	// WarnNilDereference indicates field access on a pointer type without
+	// a nil guard ({{with}} or {{if}}).
+	WarnNilDereference
+
+	// WarnInterfaceFieldAccess indicates field access on an interface type
+	// that cannot be statically verified.
+	WarnInterfaceFieldAccess
+)
+
+// PackageWarningFunc is called when a non-fatal issue is detected.
+// The category identifies the warning type, allowing callers to filter.
+type PackageWarningFunc func(category WarningCategory, pos token.Position, message string)
 
 // Package discovers all .ExecuteTemplate calls in the given package,
 // resolves receiver variables to their template construction chains,
@@ -41,7 +62,7 @@ type WarningFunc func(pos token.Position, message string)
 // ExecuteTemplate must be called with a string literal for the second parameter.
 // If warn is non-nil, it is called for ExecuteTemplate calls that use a
 // non-static string for the template name argument.
-func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn WarningFunc) error {
+func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	pending, receivers := findExecuteCalls(pkg, warn)
 	resolved, resolveErrs := resolveTemplates(pkg, receivers)
 	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate)
@@ -51,7 +72,7 @@ func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc
 // findExecuteCalls walks the package syntax looking for ExecuteTemplate calls
 // and returns the pending calls along with the set of receiver objects that
 // need template resolution.
-func findExecuteCalls(pkg *packages.Package, warn WarningFunc) ([]pendingCall, map[types.Object]struct{}) {
+func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pendingCall, map[types.Object]struct{}) {
 	var pending []pendingCall
 	receiverSet := make(map[types.Object]struct{})
 
@@ -81,7 +102,7 @@ func findExecuteCalls(pkg *packages.Package, warn WarningFunc) ([]pendingCall, m
 			if !ok {
 				if warn != nil {
 					pos := pkg.Fset.Position(call.Args[1].Pos())
-					warn(pos, "ExecuteTemplate called with non-static template name")
+					warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
 				}
 				return true
 			}

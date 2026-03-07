@@ -36,7 +36,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 
 	flagSet := flag.NewFlagSet("check-templates", flag.ContinueOnError)
 	flagSet.BoolVar(&verbose, "v", false, "show all calls")
-	flagSet.BoolVar(&warn, "w", false, "warn about ExecuteTemplate calls with non-static template names")
+	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unguarded pointer access)")
 	flagSet.StringVar(&dir, "C", dir, "change directory")
 	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv or jsonl")
 	if err := flagSet.Parse(args); err != nil {
@@ -84,11 +84,11 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 		}, func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
 			loc, _ := t.ErrorContext(node)
 			writeCall(parseLocation(loc), t.Name, tp)
-		}, func() check.WarningFunc {
+		}, func() check.PackageWarningFunc {
 			if !warn {
 				return nil
 			}
-			return func(pos token.Position, message string) {
+			return func(_ check.WarningCategory, pos token.Position, message string) {
 				_, _ = fmt.Fprintf(stderr, "warning: %s: %s\n", pos, message)
 			}
 		}()); err != nil {
