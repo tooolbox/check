@@ -22,7 +22,7 @@ func newError(tree *parse.Tree, node parse.Node, message string, args ...any) *E
 	return &Error{
 		Tree: tree,
 		Node: node,
-		err:  fmt.Errorf("type check failed: %s: executing %q at <%s>: %w", loc, tree.Name, context, fmt.Errorf(message, args...)),
+		err:  fmt.Errorf("%s: executing %q at <%s>: %s (E001)", loc, tree.Name, context, fmt.Sprintf(message, args...)),
 	}
 }
 

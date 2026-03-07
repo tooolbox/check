@@ -1,7 +1,7 @@
 # Warn when accessing fields on an interface type with -w flag.
 
 check-templates -w
-stderr 'warning - field access .Title on interface type any cannot be statically verified'
+stderr 'field access .Title on interface type any cannot be statically verified \(W004\)'
 
 -- go.mod --
 module example.com/app

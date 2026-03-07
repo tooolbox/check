@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"text/template/parse"
@@ -93,7 +92,7 @@ func TestTree(t *testing.T) {
 			Template: `{{.Field}}`,
 			Data:     Void{},
 			Error: func(t *testing.T, err, _ error, tp types.Type) {
-				require.EqualError(t, err, fmt.Sprintf(`type check failed: template:1:2: executing "template" at <.Field>: Field not found on %s`, tp))
+				require.EqualError(t, err, fmt.Sprintf(`template:1:2: executing "template" at <.Field>: Field not found on %s (E001)`, tp))
 			},
 		},
 		{
@@ -110,7 +109,7 @@ func TestTree(t *testing.T) {
 				require.NotNil(t, method)
 				methodPos := testPkg.Fset.Position(method.Pos())
 
-				require.EqualError(t, err, fmt.Sprintf(`type check failed: template:1:2: executing "template" at <.Method>: function Method has 0 return values; should be 1 or 2: incorrect signature at %s`, methodPos))
+				require.EqualError(t, err, fmt.Sprintf(`template:1:2: executing "template" at <.Method>: function Method has 0 return values; should be 1 or 2: incorrect signature at %s (E001)`, methodPos))
 			},
 		},
 		{
@@ -132,7 +131,7 @@ func TestTree(t *testing.T) {
 				require.NotNil(t, method)
 				methodPos := testPkg.Fset.Position(method.Pos())
 
-				require.EqualError(t, err, fmt.Sprintf(`type check failed: template:1:2: executing "template" at <.Method>: invalid function signature for Method: second return value should be error; is int: incorrect signature at %s`, methodPos))
+				require.EqualError(t, err, fmt.Sprintf(`template:1:2: executing "template" at <.Method>: invalid function signature for Method: second return value should be error; is int: incorrect signature at %s (E001)`, methodPos))
 			},
 		},
 		{
@@ -144,7 +143,7 @@ func TestTree(t *testing.T) {
 				require.NotNil(t, method)
 				methodPos := testPkg.Fset.Position(method.Pos())
 
-				require.EqualError(t, err, fmt.Sprintf(`type check failed: template:1:2: executing "template" at <.Method>: function Method has 3 return values; should be 1 or 2: incorrect signature at %s`, methodPos))
+				require.EqualError(t, err, fmt.Sprintf(`template:1:2: executing "template" at <.Method>: function Method has 3 return values; should be 1 or 2: incorrect signature at %s (E001)`, methodPos))
 			},
 		},
 		{
@@ -163,7 +162,7 @@ func TestTree(t *testing.T) {
 				require.NotNil(t, m2)
 				methodPos := testPkg.Fset.Position(m2.Pos())
 
-				require.EqualError(t, err, fmt.Sprintf(`type check failed: template:1:9: executing "template" at <.Method.Method>: function Method has 0 return values; should be 1 or 2: incorrect signature at %s`, methodPos))
+				require.EqualError(t, err, fmt.Sprintf(`template:1:9: executing "template" at <.Method.Method>: function Method has 0 return values; should be 1 or 2: incorrect signature at %s (E001)`, methodPos))
 			},
 		},
 		{
@@ -190,7 +189,7 @@ func TestTree(t *testing.T) {
 			Error: func(t *testing.T, err, _ error, tp types.Type) {
 				fn, _, _ := types.LookupFieldOrMethod(tp, true, testPkg.Types, "Func")
 				require.NotNil(t, fn)
-				require.ErrorContains(t, err, fmt.Sprintf(`type check failed: template:1:7: executing "template" at <.Func.Method>: identifier chain not supported for type %s`, fn.Type()))
+				require.ErrorContains(t, err, fmt.Sprintf(`template:1:7: executing "template" at <.Func.Method>: identifier chain not supported for type %s`, fn.Type()))
 			},
 		},
 		{
@@ -709,7 +708,7 @@ func TestTree(t *testing.T) {
 			Data:     nil,
 			Error: func(t *testing.T, checkErr, execErr error, tp types.Type) {
 				assert.NoError(t, execErr)
-				require.ErrorContains(t, checkErr, `type check failed: template:1:8: executing "template" at <.Unknown>: Unknown not found on untyped nil`)
+				require.ErrorContains(t, checkErr, `template:1:8: executing "template" at <.Unknown>: Unknown not found on untyped nil`)
 			},
 		},
 		{
@@ -718,7 +717,7 @@ func TestTree(t *testing.T) {
 			Data:     nil,
 			Error: func(t *testing.T, checkErr, execErr error, tp types.Type) {
 				assert.NoError(t, execErr)
-				require.ErrorContains(t, checkErr, `type check failed: template:1:7: executing "template" at <.Unknown>: Unknown not found on untyped nil`)
+				require.ErrorContains(t, checkErr, `template:1:7: executing "template" at <.Unknown>: Unknown not found on untyped nil`)
 			},
 		},
 		{
@@ -839,7 +838,7 @@ func find[T any](t *testing.T, list []T, match func(p T) bool) T {
 
 func convertTextExecError(t *testing.T, err error) string {
 	require.Error(t, err)
-	return "type check failed:" + strings.TrimPrefix(err.Error(), "template:")
+	return err.Error()
 }
 
 func treeTestRowType(t *testing.T, p *packages.Package, ttRows *ast.CompositeLit, name string) types.Type {

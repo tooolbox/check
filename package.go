@@ -54,6 +54,11 @@ const (
 	WarnInterfaceFieldAccess
 )
 
+// Code returns the short diagnostic code for the warning category (e.g. "W001").
+func (c WarningCategory) Code() string {
+	return fmt.Sprintf("W%03d", int(c))
+}
+
 // PackageWarningFunc is called when a non-fatal issue is detected.
 // The category identifies the warning type, allowing callers to filter.
 type PackageWarningFunc func(category WarningCategory, pos token.Position, message string)

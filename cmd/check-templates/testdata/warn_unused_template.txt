@@ -1,7 +1,7 @@
 # Warn about templates that are defined but never referenced.
 
 check-templates -w
-stderr 'warning - template "unused.gohtml" is defined but never referenced'
+stderr 'template "unused.gohtml" is defined but never referenced \(W002\)'
 ! stderr 'index.gohtml'
 
 -- go.mod --

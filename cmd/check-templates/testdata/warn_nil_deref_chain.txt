@@ -1,7 +1,7 @@
 # Warn on unguarded pointer in a nested field chain.
 
 check-templates -w
-stderr 'warning - accessing .Value on pointer type \*example.com/app.Inner may panic if nil'
+stderr 'accessing .Value on pointer type \*example.com/app.Inner may panic if nil.* \(W003\)'
 
 -- go.mod --
 module example.com/app

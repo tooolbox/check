@@ -1,7 +1,7 @@
 # template.ParseFiles catches missing field errors.
 
 ! check-templates
-stderr 'type check failed:.*index\.html.*Missing not found on example\.com/app\.Page'
+stderr 'index\.html.*Missing not found on example\.com/app\.Page \(E001\)'
 
 -- go.mod --
 module example.com/app

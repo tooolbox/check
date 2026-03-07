@@ -88,8 +88,8 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 			if !warn {
 				return nil
 			}
-			return func(_ check.WarningCategory, pos token.Position, message string) {
-				_, _ = fmt.Fprintf(stderr, "%s: warning - %s\n", pos, message)
+			return func(cat check.WarningCategory, pos token.Position, message string) {
+				_, _ = fmt.Fprintf(stderr, "%s: %s (%s)\n", pos, message, cat.Code())
 			}
 		}()); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)

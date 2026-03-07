@@ -1,7 +1,7 @@
 # Warn when accessing fields on a pointer type without a nil guard.
 
 check-templates -w
-stderr 'warning - accessing .Title on pointer type \*example.com/app.Page may panic if nil'
+stderr 'accessing .Title on pointer type \*example.com/app.Page may panic if nil.* \(W003\)'
 
 -- go.mod --
 module example.com/app
