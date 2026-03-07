@@ -13,6 +13,7 @@ go tool check-templates ./...
 
 Flags:
 - `-v` &mdash; list each call with position, template name, and data type
+- `-w` &mdash; warn about `ExecuteTemplate` calls with non-static template names
 - `-C dir` &mdash; change working directory before loading packages
 - `-o format` &mdash; output format: `tsv` (default) or `jsonl`
 
@@ -20,7 +21,7 @@ Flags:
 
 The CLI works by statically analyzing your Go source code. It traces each `ExecuteTemplate` call back to the variable that holds the `*template.Template`, then follows that variable's initialization chain to find the template files. This means:
 
-1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression are skipped.
+1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression will produce a warning (with `-w`) and be skipped.
 
 2. **Template initialization must use static arguments.** File paths passed to `ParseFiles`, glob patterns passed to `ParseGlob`, and embed patterns passed to `ParseFS` must all be string literals.
 
@@ -46,3 +47,4 @@ Call `Execute` with a `types.Type` for the template's data (`.`) and the templat
 1. You must provide a `types.Type` for the template's root context (`.`).
 2. No support for third-party template packages (e.g. [safehtml](https://pkg.go.dev/github.com/google/safehtml)).
 3. Cannot detect runtime conditions such as out-of-range indexes or errors from boxed types.
+4. Template initialization must use static arguments — file paths, glob patterns, and embed patterns must be string literals (see [How the CLI discovers templates](#how-the-cli-discovers-templates)).
