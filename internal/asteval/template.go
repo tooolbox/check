@@ -1,10 +1,8 @@
 package asteval
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
-	"go/format"
 	"go/token"
 	"go/types"
 	"os"
@@ -365,7 +363,6 @@ func evaluateFuncMap(workingDirectory string, typesInfo *types.Info, pkg *types.
 			}
 		}
 	}
-	var buf bytes.Buffer
 	for i, exp := range lit.Elts {
 		el, ok := exp.(*ast.KeyValueExpr)
 		if !ok {
@@ -389,18 +386,13 @@ func evaluateFuncMap(workingDirectory string, typesInfo *types.Info, pkg *types.
 		//   fm[funcName] = func() (int, int) {return 0, 0} // will fail because the second result is not an error
 		fm[funcName] = fmt.Sprintln
 
-		if pkg == nil {
-			continue
+		if typesInfo != nil {
+			if tp := typesInfo.TypeOf(el.Value); tp != nil {
+				if sig, ok := tp.(*types.Signature); ok {
+					funcTypesMap[funcName] = sig
+				}
+			}
 		}
-		buf.Reset()
-		if err := format.Node(&buf, fileSet, el.Value); err != nil {
-			return err
-		}
-		tv, err := types.Eval(fileSet, pkg, lit.Pos(), buf.String())
-		if err != nil {
-			return err
-		}
-		funcTypesMap[funcName] = tv.Type.(*types.Signature)
 	}
 	return nil
 }
