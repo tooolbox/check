@@ -108,6 +108,7 @@ func Execute(global *Global, tree *parse.Tree, data types.Type) error {
 		variables: map[string]types.Type{
 			"$": data,
 		},
+		guarded: make(map[string]struct{}),
 	}
 	_, err := s.walk(tree, data, nil, tree.Root)
 	return err
@@ -116,13 +117,40 @@ func Execute(global *Global, tree *parse.Tree, data types.Type) error {
 type scope struct {
 	global    *Global
 	variables map[string]types.Type
+	guarded   map[string]struct{} // set of field paths known non-nil (e.g. ".Foo.Bar")
 }
 
 func (s *scope) child() *scope {
-	return &scope{
+	c := &scope{
 		global:    s.global,
 		variables: maps.Clone(s.variables),
+		guarded:   make(map[string]struct{}, len(s.guarded)),
 	}
+	for k, v := range s.guarded {
+		c.guarded[k] = v
+	}
+	return c
+}
+
+// pipeFieldPath extracts the field path from a pipe expression.
+// For {{with .Foo.Bar}}, returns ".Foo.Bar".
+// For {{with .}}, returns ".".
+// Returns "" if the pipe is not a simple field or dot expression.
+func pipeFieldPath(pipe *parse.PipeNode) string {
+	if pipe == nil || len(pipe.Cmds) != 1 {
+		return ""
+	}
+	cmd := pipe.Cmds[0]
+	if len(cmd.Args) != 1 {
+		return ""
+	}
+	switch n := cmd.Args[0].(type) {
+	case *parse.DotNode:
+		return "."
+	case *parse.FieldNode:
+		return "." + strings.Join(n.Ident, ".")
+	}
+	return ""
 }
 
 func (s *scope) walk(tree *parse.Tree, dot, prev types.Type, node parse.Node) (types.Type, error) {
@@ -227,6 +255,9 @@ func (s *scope) checkIfNode(tree *parse.Tree, dot types.Type, n *parse.IfNode) e
 		return err
 	}
 	ifScope := s.child()
+	if path := pipeFieldPath(n.Pipe); path != "" {
+		ifScope.guarded[path] = struct{}{}
+	}
 	if _, err := ifScope.walk(tree, dot, nil, n.List); err != nil {
 		return err
 	}
@@ -246,6 +277,11 @@ func (s *scope) checkWithNode(tree *parse.Tree, dot types.Type, n *parse.WithNod
 		return err
 	}
 	withScope := child.child()
+	if path := pipeFieldPath(n.Pipe); path != "" {
+		withScope.guarded[path] = struct{}{}
+	}
+	// Inside {{with}}, dot is reassigned to the pipe value, which is known non-nil.
+	withScope.guarded["."] = struct{}{}
 	if _, err := withScope.walk(tree, x, nil, n.List); err != nil {
 		return err
 	}
@@ -429,6 +465,20 @@ func (s *scope) notAFunction(tree *parse.Tree, node parse.Node, args []parse.Nod
 func (s *scope) checkIdentifiers(tree *parse.Tree, dot types.Type, n parse.Node, idents []string, args []types.Type) (types.Type, error) {
 	x := dot
 	for i, ident := range idents {
+		if _, isPtr := x.(*types.Pointer); isPtr && s.global.Warn != nil {
+			// Build the path of the pointer value being dereferenced.
+			// If i==0, the pointer is dot itself (path ".").
+			// If i>0, it's the field path up to this point (e.g. ".Bar").
+			var ptrPath string
+			if i == 0 {
+				ptrPath = "."
+			} else {
+				ptrPath = "." + strings.Join(idents[:i], ".")
+			}
+			if _, guarded := s.guarded[ptrPath]; !guarded {
+				s.global.Warn(WarnNilDereference, tree, n, fmt.Sprintf("accessing .%s on pointer type %s may panic if nil; consider guarding with {{with}} or {{if}}", ident, s.global.TypeString(x)))
+			}
+		}
 		x = dereference(x)
 		switch xx := x.(type) {
 		case *types.Map:
