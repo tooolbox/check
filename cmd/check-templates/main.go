@@ -89,7 +89,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 				return nil
 			}
 			return func(_ check.WarningCategory, pos token.Position, message string) {
-				_, _ = fmt.Fprintf(stderr, "warning: %s: %s\n", pos, message)
+				_, _ = fmt.Fprintf(stderr, "%s: warning - %s\n", pos, message)
 			}
 		}()); err != nil {
 			_, _ = fmt.Fprintln(stderr, err)

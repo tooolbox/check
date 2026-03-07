@@ -100,7 +100,7 @@ func render() {
 
 **Warns** if `unused.gohtml` exists in the embed but is never referenced:
 ```
-warning: main.go:5:5: template "unused.gohtml" is defined but never referenced
+main.go:5:5: warning - template "unused.gohtml" is defined but never referenced
 ```
 
 ### Non-static ExecuteTemplate name

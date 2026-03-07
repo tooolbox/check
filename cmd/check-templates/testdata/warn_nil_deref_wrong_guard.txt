@@ -1,7 +1,7 @@
 # Guarding .Foo does not suppress warning for unguarded .Bar access.
 
 check-templates -w
-stderr 'warning:.*accessing .Name on pointer type \*example.com/app.Bar may panic if nil'
+stderr 'warning - accessing .Name on pointer type \*example.com/app.Bar may panic if nil'
 ! stderr 'accessing .Title'
 
 -- go.mod --

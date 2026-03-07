@@ -1,7 +1,7 @@
 # ExecuteTemplate with a non-static template name produces a warning when -w is passed.
 
 check-templates -w
-stderr 'warning:.*ExecuteTemplate called with non-static template name'
+stderr 'warning - ExecuteTemplate called with non-static template name'
 
 -- go.mod --
 module example.com/app
