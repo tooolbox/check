@@ -1,7 +1,7 @@
-# ExecuteTemplate with a non-static template name produces a warning when -w is passed.
+# ExecuteTemplate with a named constant resolves the template name.
 
-check-templates -w
-stderr 'ExecuteTemplate called with non-static template name \(W001\)'
+check-templates
+! stderr .
 
 -- go.mod --
 module example.com/app
@@ -24,16 +24,14 @@ var (
 	templates = template.Must(template.ParseFS(source, "*"))
 )
 
+const indexTemplate = "index.gohtml"
+
 type Page struct {
 	Title string
 }
 
-func templateName() string {
-	return "index.gohtml"
-}
-
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	_ = templates.ExecuteTemplate(w, templateName(), Page{Title: "Home"})
+	_ = templates.ExecuteTemplate(w, indexTemplate, Page{Title: "Home"})
 }
 
 var _ = fmt.Sprint

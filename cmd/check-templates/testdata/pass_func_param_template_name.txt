@@ -1,7 +1,7 @@
-# ExecuteTemplate with a non-static template name produces a warning when -w is passed.
+# ExecuteTemplate in a wrapper function resolves template name from call site.
 
-check-templates -w
-stderr 'ExecuteTemplate called with non-static template name \(W001\)'
+check-templates
+! stderr .
 
 -- go.mod --
 module example.com/app
@@ -28,12 +28,12 @@ type Page struct {
 	Title string
 }
 
-func templateName() string {
-	return "index.gohtml"
+func render(w http.ResponseWriter, name string, data Page) {
+	_ = templates.ExecuteTemplate(w, name, data)
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	_ = templates.ExecuteTemplate(w, templateName(), Page{Title: "Home"})
+	render(w, "index.gohtml", Page{Title: "Home"})
 }
 
 var _ = fmt.Sprint

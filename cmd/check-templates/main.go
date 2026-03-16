@@ -74,12 +74,17 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 	}
 
 	exitCode := 0
+
+	// Collect deferred calls from each package so they can be resolved
+	// by importing packages (cross-package call-graph tracing).
+	var allDeferred []check.DeferredCall
+
 	for _, pkg := range pkgs {
 		for _, e := range pkg.Errors {
 			_, _ = fmt.Fprintln(stderr, e)
 			exitCode = 1
 		}
-		if err := check.Package(pkg, func(node *ast.CallExpr, t *parse.Tree, tp types.Type) {
+		deferred, err := check.PackageWithDeferred(pkg, func(node *ast.CallExpr, t *parse.Tree, tp types.Type) {
 			writeCall(fset.Position(node.Pos()), t.Name, tp)
 		}, func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
 			loc, _ := t.ErrorContext(node)
@@ -91,10 +96,12 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 			return func(cat check.WarningCategory, pos token.Position, message string) {
 				_, _ = fmt.Fprintf(stderr, "%s: %s (%s)\n", pos, message, cat.Code())
 			}
-		}()); err != nil {
+		}(), allDeferred)
+		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			exitCode = 1
 		}
+		allDeferred = append(allDeferred, deferred...)
 	}
 	return exitCode
 }

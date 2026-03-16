@@ -23,6 +23,15 @@ type pendingCall struct {
 	receiverObj  types.Object
 	templateName string
 	dataType     types.Type
+
+	// For deferred resolution via call graph tracing.
+	// nameParamIdx >= 0 means the template name comes from a function parameter.
+	// dataParamIdx >= 0 means the data type comes from a function parameter.
+	// receiverParamIdx >= 0 means the template receiver comes from a function parameter.
+	nameParamIdx     int
+	dataParamIdx     int
+	receiverParamIdx int
+	enclosingFunc    types.Object
 }
 
 type resolvedTemplate struct {
@@ -63,6 +72,23 @@ func (c WarningCategory) Code() string {
 // The category identifies the warning type, allowing callers to filter.
 type PackageWarningFunc func(category WarningCategory, pos token.Position, message string)
 
+// DeferredCall represents an ExecuteTemplate call whose template name or
+// data type could not be resolved within its own package. Callers from
+// other packages may provide the concrete values via call-graph tracing.
+type DeferredCall struct {
+	pendingCall
+	resolved map[types.Object]*resolvedTemplate
+
+	// FuncObj is the exported function that wraps the ExecuteTemplate call.
+	FuncObj types.Object
+	// NameParamIdx is the parameter index providing the template name (-1 if resolved).
+	NameParamIdx int
+	// DataParamIdx is the parameter index providing the data (-1 if resolved).
+	DataParamIdx int
+	// ReceiverParamIdx is the parameter index providing the template receiver (-1 if resolved).
+	ReceiverParamIdx int
+}
+
 // Package discovers all .ExecuteTemplate calls in the given package,
 // resolves receiver variables to their template construction chains,
 // and type-checks each call.
@@ -71,10 +97,136 @@ type PackageWarningFunc func(category WarningCategory, pos token.Position, messa
 // If warn is non-nil, it is called for non-fatal issues such as unused templates
 // or unguarded pointer access.
 func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
+	_, err := PackageWithDeferred(pkg, inspectCall, inspectTemplate, warn, nil)
+	return err
+}
+
+// PackageWithDeferred is like Package but also accepts deferred calls from
+// dependency packages and returns any new deferred calls discovered in this
+// package. This enables cross-package call-graph tracing.
+func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc, imported []DeferredCall) ([]DeferredCall, error) {
 	pending, receivers := findExecuteCalls(pkg, warn)
+
+	// Resolve calls from imported packages' deferred wrappers.
+	if len(imported) > 0 {
+		pending = resolveImportedCalls(pkg, pending, receivers, imported)
+	}
+
+	pending = resolveCallGraph(pkg, pending, receivers, warn)
+
+	// Collect deferred calls for exported functions before resolving templates.
+	var deferred []DeferredCall
+	var resolvedPending []pendingCall
+	for _, p := range pending {
+		if p.nameParamIdx >= 0 || p.dataParamIdx >= 0 || p.receiverParamIdx >= 0 {
+			if p.enclosingFunc != nil && p.enclosingFunc.Exported() {
+				deferred = append(deferred, DeferredCall{
+					pendingCall:      p,
+					FuncObj:          p.enclosingFunc,
+					NameParamIdx:     p.nameParamIdx,
+					DataParamIdx:     p.dataParamIdx,
+					ReceiverParamIdx: p.receiverParamIdx,
+				})
+			}
+			continue
+		}
+		resolvedPending = append(resolvedPending, p)
+	}
+
 	resolved, resolveErrs := resolveTemplates(pkg, receivers)
-	callErr := checkCalls(pkg, pending, resolved, inspectCall, inspectTemplate, warn)
-	return errors.Join(append(resolveErrs, callErr)...)
+
+	// Attach resolved templates to deferred calls.
+	for i := range deferred {
+		deferred[i].resolved = resolved
+	}
+
+	callErr := checkCalls(pkg, resolvedPending, resolved, inspectCall, inspectTemplate, warn)
+	return deferred, errors.Join(append(resolveErrs, callErr)...)
+}
+
+// resolveImportedCalls finds calls in pkg to exported wrapper functions from
+// imported packages and creates pending calls with resolved arguments.
+func resolveImportedCalls(pkg *packages.Package, pending []pendingCall, receivers map[types.Object]struct{}, imported []DeferredCall) []pendingCall {
+	if len(imported) == 0 {
+		return pending
+	}
+
+	// Build a lookup from function object to deferred calls.
+	deferredByFunc := make(map[types.Object][]DeferredCall)
+	for _, d := range imported {
+		deferredByFunc[d.FuncObj] = append(deferredByFunc[d.FuncObj], d)
+	}
+
+	// Scan all call expressions in this package.
+	for _, file := range pkg.Syntax {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// Find the function being called.
+			var calledObj types.Object
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				calledObj = pkg.TypesInfo.Uses[fn]
+			case *ast.SelectorExpr:
+				calledObj = pkg.TypesInfo.Uses[fn.Sel]
+			}
+			if calledObj == nil {
+				return true
+			}
+
+			defs, ok := deferredByFunc[calledObj]
+			if !ok {
+				return true
+			}
+
+			for _, d := range defs {
+				p := d.pendingCall
+
+				// Resolve template name from this call site.
+				if d.NameParamIdx >= 0 && d.NameParamIdx < len(call.Args) {
+					name, ok := asteval.ResolveStringExpr(pkg.TypesInfo, pkg.Syntax, call.Args[d.NameParamIdx])
+					if !ok {
+						continue
+					}
+					p.templateName = name
+					p.nameParamIdx = -1
+				}
+
+				// Resolve data type from this call site.
+				if d.DataParamIdx >= 0 && d.DataParamIdx < len(call.Args) {
+					concreteType := pkg.TypesInfo.TypeOf(call.Args[d.DataParamIdx])
+					if concreteType != nil && !isEmptyInterface(concreteType) {
+						p.dataType = concreteType
+						p.dataParamIdx = -1
+					}
+				}
+
+				// Resolve receiver from this call site.
+				if d.ReceiverParamIdx >= 0 && d.ReceiverParamIdx < len(call.Args) {
+					if ident, ok := call.Args[d.ReceiverParamIdx].(*ast.Ident); ok {
+						if argObj := pkg.TypesInfo.Uses[ident]; argObj != nil {
+							p.receiverObj = argObj
+							p.receiverParamIdx = -1
+							receivers[argObj] = struct{}{}
+						}
+					}
+				}
+
+				// Only add if template name is resolved.
+				if p.nameParamIdx < 0 {
+					p.enclosingFunc = nil
+					pending = append(pending, p)
+				}
+			}
+
+			return true
+		})
+	}
+
+	return pending
 }
 
 // findExecuteCalls walks the package syntax looking for ExecuteTemplate calls
@@ -106,20 +258,60 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 			if obj == nil {
 				return true
 			}
-			templateName, ok := asteval.BasicLiteralString(call.Args[1])
-			if !ok {
-				if warn != nil {
-					pos := pkg.Fset.Position(call.Args[1].Pos())
-					warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
-				}
-				return true
-			}
+			templateName, nameOk := asteval.ResolveStringExpr(pkg.TypesInfo, pkg.Syntax, call.Args[1])
 			dataType := pkg.TypesInfo.TypeOf(call.Args[2])
+
+			nameParamIdx := -1
+			dataParamIdx := -1
+			receiverParamIdx := -1
+			var enclosingFunc types.Object
+
+			if !nameOk {
+				// Check if the template name is a function parameter
+				// that can be resolved via call-graph tracing.
+				idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, call.Args[1])
+				if isParam {
+					nameParamIdx = idx
+					enclosingFunc = fObj
+				} else {
+					if warn != nil {
+						pos := pkg.Fset.Position(call.Args[1].Pos())
+						warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
+					}
+					return true
+				}
+			}
+
+			// Check if the data type is interface{}/any and comes from
+			// a function parameter (Tier 4).
+			if isEmptyInterface(dataType) {
+				idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, call.Args[2])
+				if isParam {
+					dataParamIdx = idx
+					if enclosingFunc == nil {
+						enclosingFunc = fObj
+					}
+				}
+			}
+
+			// Check if the receiver is a function parameter.
+			idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, receiverIdent)
+			if isParam {
+				receiverParamIdx = idx
+				if enclosingFunc == nil {
+					enclosingFunc = fObj
+				}
+			}
+
 			pending = append(pending, pendingCall{
-				call:         call,
-				receiverObj:  obj,
-				templateName: templateName,
-				dataType:     dataType,
+				call:             call,
+				receiverObj:      obj,
+				templateName:     templateName,
+				dataType:         dataType,
+				nameParamIdx:     nameParamIdx,
+				dataParamIdx:     dataParamIdx,
+				receiverParamIdx: receiverParamIdx,
+				enclosingFunc:    enclosingFunc,
 			})
 			receiverSet[obj] = struct{}{}
 			return true
@@ -354,6 +546,194 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 	}
 
 	return errors.Join(errs...)
+}
+
+// isEmptyInterface reports whether tp is the empty interface (interface{} or any).
+func isEmptyInterface(tp types.Type) bool {
+	if tp == nil {
+		return false
+	}
+	iface, ok := tp.Underlying().(*types.Interface)
+	return ok && iface.NumMethods() == 0 && iface.NumEmbeddeds() == 0
+}
+
+// resolveCallGraph expands pending calls that have unresolved template names
+// or data types by tracing through function call sites within the package.
+// It returns the expanded list of pending calls and emits warnings for any
+// calls that could not be resolved.
+func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers map[types.Object]struct{}, warn PackageWarningFunc) []pendingCall {
+	// Check if any calls need resolution.
+	needsResolution := false
+	for _, p := range pending {
+		if p.nameParamIdx >= 0 || p.dataParamIdx >= 0 || p.receiverParamIdx >= 0 {
+			needsResolution = true
+			break
+		}
+	}
+	if !needsResolution {
+		return pending
+	}
+
+	callIndex := asteval.BuildCallSiteIndex(pkg.TypesInfo, pkg.Syntax)
+
+	// Iterate to a fixed point to handle multi-level call chains.
+	const maxIterations = 5
+	for iter := range maxIterations {
+		changed := false
+		var expanded []pendingCall
+
+		for _, p := range pending {
+			if p.nameParamIdx < 0 && p.dataParamIdx < 0 && p.receiverParamIdx < 0 {
+				// Already fully resolved.
+				expanded = append(expanded, p)
+				continue
+			}
+
+			if p.enclosingFunc == nil {
+				if p.nameParamIdx >= 0 {
+					if warn != nil {
+						pos := pkg.Fset.Position(p.call.Args[1].Pos())
+						warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
+					}
+					continue
+				}
+				// Name resolved, keep with current type info.
+				p.dataParamIdx = -1
+				p.receiverParamIdx = -1
+				expanded = append(expanded, p)
+				continue
+			}
+
+			callSites := callIndex[p.enclosingFunc]
+			if len(callSites) == 0 {
+				if p.nameParamIdx >= 0 {
+					// No intra-package call sites. If the function is
+					// exported, keep the call for cross-package deferred
+					// resolution. Otherwise, warn and drop.
+					if p.enclosingFunc.Exported() {
+						expanded = append(expanded, p)
+					} else if warn != nil {
+						pos := pkg.Fset.Position(p.call.Args[1].Pos())
+						warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
+					}
+					continue
+				}
+				// Name is resolved but data/receiver are not. Keep the
+				// call with whatever type information we have so that
+				// downstream warnings (e.g. WarnInterfaceFieldAccess) fire.
+				p.dataParamIdx = -1
+				p.receiverParamIdx = -1
+				p.enclosingFunc = nil
+				expanded = append(expanded, p)
+				continue
+			}
+
+			for _, cs := range callSites {
+				newCall := p
+				resolvedName := p.nameParamIdx < 0
+				resolvedData := p.dataParamIdx < 0
+
+				// Resolve template name from call site argument.
+				if p.nameParamIdx >= 0 && p.nameParamIdx < len(cs.Args) {
+					arg := cs.Args[p.nameParamIdx]
+					name, ok := asteval.ResolveStringExpr(pkg.TypesInfo, pkg.Syntax, arg)
+					if ok {
+						newCall.templateName = name
+						newCall.nameParamIdx = -1
+						newCall.enclosingFunc = nil
+						resolvedName = true
+					} else {
+						// Check if this call site arg is itself a function parameter.
+						idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, arg)
+						if isParam {
+							newCall.nameParamIdx = idx
+							newCall.enclosingFunc = fObj
+							changed = true
+						} else {
+							// Unresolvable at this call site.
+							if warn != nil {
+								pos := pkg.Fset.Position(arg.Pos())
+								warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
+							}
+							continue
+						}
+					}
+				}
+
+				// Resolve data type from call site argument.
+				if p.dataParamIdx >= 0 && p.dataParamIdx < len(cs.Args) {
+					arg := cs.Args[p.dataParamIdx]
+					concreteType := pkg.TypesInfo.TypeOf(arg)
+					if concreteType != nil && !isEmptyInterface(concreteType) {
+						newCall.dataType = concreteType
+						newCall.dataParamIdx = -1
+						resolvedData = true
+					} else {
+						// Check if this call site arg is itself a function parameter.
+						idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, arg)
+						if isParam {
+							newCall.dataParamIdx = idx
+							if newCall.enclosingFunc == nil {
+								newCall.enclosingFunc = fObj
+							}
+							changed = true
+						}
+						// If not a param, keep the interface{} type — it
+						// will be handled by WarnInterfaceFieldAccess downstream.
+					}
+				}
+
+				// Resolve template receiver from call site argument.
+				if p.receiverParamIdx >= 0 && p.receiverParamIdx < len(cs.Args) {
+					arg := cs.Args[p.receiverParamIdx]
+					if ident, ok := arg.(*ast.Ident); ok {
+						if argObj := pkg.TypesInfo.Uses[ident]; argObj != nil {
+							newCall.receiverObj = argObj
+							newCall.receiverParamIdx = -1
+							receivers[argObj] = struct{}{}
+							changed = true
+						}
+					}
+				}
+
+				if resolvedName {
+					allResolved := resolvedData && newCall.receiverParamIdx < 0
+					if allResolved {
+						newCall.enclosingFunc = nil
+					}
+					expanded = append(expanded, newCall)
+					if !allResolved || p.nameParamIdx >= 0 {
+						changed = true
+					}
+				} else {
+					expanded = append(expanded, newCall)
+				}
+			}
+		}
+
+		pending = expanded
+
+		if !changed || iter == maxIterations-1 {
+			// Emit warnings for remaining unresolved calls, keeping
+			// exported-function calls for cross-package deferred resolution.
+			var final []pendingCall
+			for _, p := range pending {
+				if p.nameParamIdx >= 0 {
+					if p.enclosingFunc != nil && p.enclosingFunc.Exported() {
+						final = append(final, p)
+					} else if warn != nil {
+						pos := pkg.Fset.Position(p.call.Args[1].Pos())
+						warn(WarnNonStaticTemplateName, pos, "ExecuteTemplate called with non-static template name")
+					}
+					continue
+				}
+				final = append(final, p)
+			}
+			return final
+		}
+	}
+
+	return pending
 }
 
 func packageDirectory(pkg *packages.Package) string {

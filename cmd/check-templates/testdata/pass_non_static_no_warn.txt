@@ -28,9 +28,12 @@ type Page struct {
 	Title string
 }
 
+func templateName() string {
+	return "index.gohtml"
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	name := "index.gohtml"
-	_ = templates.ExecuteTemplate(w, name, Page{Title: "Home"})
+	_ = templates.ExecuteTemplate(w, templateName(), Page{Title: "Home"})
 }
 
 var _ = fmt.Sprint
