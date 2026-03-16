@@ -8,7 +8,9 @@ import (
 	"go/types"
 	"html/template"
 	"io"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"slices"
 	"strconv"
 	"sync"
@@ -45,7 +47,7 @@ func TestTree(t *testing.T) {
 	require.True(t, ok, "failed to find current file name")
 	fileIndex := slices.IndexFunc(testPkg.Syntax, func(file *ast.File) bool {
 		pos := testPkg.Fset.Position(file.Pos())
-		return pos.Filename == currentFileName
+		return strings.EqualFold(filepath.Clean(pos.Filename), filepath.Clean(currentFileName))
 	})
 	if fileIndex < 0 {
 		t.Fatal("no check_test.go found")
@@ -838,7 +840,13 @@ func find[T any](t *testing.T, list []T, match func(p T) bool) T {
 
 func convertTextExecError(t *testing.T, err error) string {
 	require.Error(t, err)
-	return err.Error()
+	msg := err.Error()
+	// Go's template errors use "template: filename:line:col" format, while
+	// check errors use "filename:line:col ... (E001)" diagnostic format.
+	// Strip the "template: " prefix and append the error code.
+	msg = strings.TrimPrefix(msg, "template: ")
+	msg += " (E001)"
+	return msg
 }
 
 func treeTestRowType(t *testing.T, p *packages.Package, ttRows *ast.CompositeLit, name string) types.Type {
