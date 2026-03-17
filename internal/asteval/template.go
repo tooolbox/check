@@ -455,7 +455,7 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 	filtered := matches[:0]
 	for _, ef := range matches {
 		for j, pattern := range templateNames {
-			match, err := filepath.Match(pattern, ef)
+			match, err := filepath.Match(filepath.FromSlash(pattern), ef)
 			if err != nil {
 				return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[j+1].Pos(), fmt.Errorf("bad pattern %q: %w", pattern, err))
 			}
