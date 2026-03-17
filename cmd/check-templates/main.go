@@ -14,12 +14,25 @@ import (
 	"strings"
 	"text/template/parse"
 
+	"golang.org/x/tools/go/analysis/singlechecker"
 	"golang.org/x/tools/go/packages"
 
 	"github.com/typelate/check"
+	"github.com/typelate/check/analyzer"
 )
 
 func main() {
+	// When invoked as a go vet -vettool, go vet probes with -V=full (build ID),
+	// -flags (flag listing) and -json (actual check). Detect any of these and
+	// delegate entirely to singlechecker, which speaks the full unitchecker
+	// protocol.
+	for _, arg := range os.Args[1:] {
+		if arg == "-flags" || arg == "-json" || strings.HasPrefix(arg, "-V") {
+			singlechecker.Main(analyzer.Analyzer)
+			return // singlechecker calls os.Exit; this is unreachable
+		}
+	}
+
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Fatalln(err)
