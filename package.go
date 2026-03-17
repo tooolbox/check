@@ -69,6 +69,10 @@ const (
 	// WarnUnusedVariable indicates a template variable that is declared
 	// (via $x := ...) but never referenced.
 	WarnUnusedVariable
+
+	// WarnDeadBranch indicates a conditional branch that can never execute
+	// because the condition is a literal true, false, or nil constant.
+	WarnDeadBranch
 )
 
 // Code returns the short diagnostic code for the warning category (e.g. "W001").

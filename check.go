@@ -274,10 +274,42 @@ func (s *scope) checkPipeNode(tree *parse.Tree, dot types.Type, n *parse.PipeNod
 	return result, nil
 }
 
+// deadBranchKind inspects a pipe to see if it is a literal constant condition.
+// Returns "true", "false", or "nil" if the pipe is a single literal BoolNode
+// or NilNode; otherwise returns "".
+func deadBranchKind(pipe *parse.PipeNode) string {
+	if pipe == nil || len(pipe.Cmds) != 1 {
+		return ""
+	}
+	cmd := pipe.Cmds[0]
+	if len(cmd.Args) != 1 {
+		return ""
+	}
+	switch n := cmd.Args[0].(type) {
+	case *parse.BoolNode:
+		if n.True {
+			return "true"
+		}
+		return "false"
+	}
+	return ""
+}
+
 func (s *scope) checkIfNode(tree *parse.Tree, dot types.Type, n *parse.IfNode) error {
 	_, err := s.walk(tree, dot, nil, n.Pipe)
 	if err != nil {
 		return err
+	}
+	// Warn about literal-constant conditions.
+	if s.global.Warn != nil {
+		switch deadBranchKind(n.Pipe) {
+		case "true":
+			if n.ElseList != nil {
+				s.global.Warn(WarnDeadBranch, tree, n.Pipe, "else branch is unreachable: condition is always true")
+			}
+		case "false":
+			s.global.Warn(WarnDeadBranch, tree, n.Pipe, "if branch is unreachable: condition is always false")
+		}
 	}
 	ifScope := s.child()
 	if path := pipeFieldPath(n.Pipe); path != "" {
@@ -304,6 +336,17 @@ func (s *scope) checkWithNode(tree *parse.Tree, dot types.Type, n *parse.WithNod
 		return err
 	}
 	child.warnUnused(tree)
+	// Warn about literal-constant conditions.
+	if s.global.Warn != nil {
+		switch deadBranchKind(n.Pipe) {
+		case "true":
+			if n.ElseList != nil {
+				s.global.Warn(WarnDeadBranch, tree, n.Pipe, "else branch is unreachable: condition is always true")
+			}
+		case "false":
+			s.global.Warn(WarnDeadBranch, tree, n.Pipe, "with branch is unreachable: condition is always false")
+		}
+	}
 	withScope := child.child()
 	if path := pipeFieldPath(n.Pipe); path != "" {
 		withScope.guarded[path] = struct{}{}
