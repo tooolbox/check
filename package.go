@@ -24,6 +24,10 @@ type pendingCall struct {
 	templateName string
 	dataType     types.Type
 
+	// isExecute is true for Execute (2-arg) calls, where the template
+	// name is the receiver's root template name (resolved later).
+	isExecute bool
+
 	// For deferred resolution via call graph tracing.
 	// nameParamIdx >= 0 means the template name comes from a function parameter.
 	// dataParamIdx >= 0 means the data type comes from a function parameter.
@@ -61,6 +65,10 @@ const (
 	// WarnInterfaceFieldAccess indicates field access on an interface type
 	// that cannot be statically verified.
 	WarnInterfaceFieldAccess
+
+	// WarnUnusedVariable indicates a template variable that is declared
+	// (via $x := ...) but never referenced.
+	WarnUnusedVariable
 )
 
 // Code returns the short diagnostic code for the warning category (e.g. "W001").
@@ -229,9 +237,9 @@ func resolveImportedCalls(pkg *packages.Package, pending []pendingCall, receiver
 	return pending
 }
 
-// findExecuteCalls walks the package syntax looking for ExecuteTemplate calls
-// and returns the pending calls along with the set of receiver objects that
-// need template resolution.
+// findExecuteCalls walks the package syntax looking for ExecuteTemplate and
+// Execute calls and returns the pending calls along with the set of receiver
+// objects that need template resolution.
 func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pendingCall, map[types.Object]struct{}) {
 	var pending []pendingCall
 	receiverSet := make(map[types.Object]struct{})
@@ -239,13 +247,25 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 	for _, file := range pkg.Syntax {
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
-			if !ok || len(call.Args) != 3 {
+			if !ok {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "ExecuteTemplate" {
+			if !ok {
 				return true
 			}
+
+			isExecute := false
+			switch {
+			case sel.Sel.Name == "ExecuteTemplate" && len(call.Args) == 3:
+				// tpl.ExecuteTemplate(w, name, data)
+			case sel.Sel.Name == "Execute" && len(call.Args) == 2:
+				// tpl.Execute(w, data)
+				isExecute = true
+			default:
+				return true
+			}
+
 			// Verify the method belongs to html/template or text/template.
 			if !asteval.IsTemplateMethod(pkg.TypesInfo, sel) {
 				return true
@@ -258,6 +278,46 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 			if obj == nil {
 				return true
 			}
+
+			if isExecute {
+				// Execute calls use the receiver's root template name,
+				// which is resolved later in checkCalls.
+				dataType := pkg.TypesInfo.TypeOf(call.Args[1])
+
+				dataParamIdx := -1
+				receiverParamIdx := -1
+				var enclosingFunc types.Object
+
+				if isEmptyInterface(dataType) {
+					idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, call.Args[1])
+					if isParam {
+						dataParamIdx = idx
+						enclosingFunc = fObj
+					}
+				}
+
+				idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, receiverIdent)
+				if isParam {
+					receiverParamIdx = idx
+					if enclosingFunc == nil {
+						enclosingFunc = fObj
+					}
+				}
+
+				pending = append(pending, pendingCall{
+					call:             call,
+					receiverObj:      obj,
+					isExecute:        true,
+					dataType:         dataType,
+					nameParamIdx:     -1,
+					dataParamIdx:     dataParamIdx,
+					receiverParamIdx: receiverParamIdx,
+					enclosingFunc:    enclosingFunc,
+				})
+				receiverSet[obj] = struct{}{}
+				return true
+			}
+
 			templateName, nameOk := asteval.ResolveStringExpr(pkg.TypesInfo, pkg.Syntax, call.Args[1])
 			dataType := pkg.TypesInfo.TypeOf(call.Args[2])
 
@@ -492,7 +552,12 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		if !ok {
 			continue
 		}
-		looked := rt.templates.Lookup(p.templateName)
+		// For Execute calls, use the receiver's root template name.
+		templateName := p.templateName
+		if p.isExecute {
+			templateName = rt.templates.Name()
+		}
+		looked := rt.templates.Lookup(templateName)
 		if looked == nil {
 			continue
 		}
@@ -501,7 +566,7 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 			if referenced[p.receiverObj] == nil {
 				referenced[p.receiverObj] = make(map[string]struct{})
 			}
-			referenced[p.receiverObj][p.templateName] = struct{}{}
+			referenced[p.receiverObj][templateName] = struct{}{}
 		}
 		global := NewGlobal(pkg.Types, pkg.Fset, rt.templates, mergedFunctions)
 		global.InspectTemplateNode = wrappedInspect

@@ -108,9 +108,12 @@ func Execute(global *Global, tree *parse.Tree, data types.Type) error {
 		variables: map[string]types.Type{
 			"$": data,
 		},
-		guarded: make(map[string]struct{}),
+		guarded:  make(map[string]struct{}),
+		declared: make(map[string]parse.Node),
+		used:     make(map[string]struct{}),
 	}
 	_, err := s.walk(tree, data, nil, tree.Root)
+	s.warnUnused(tree)
 	return err
 }
 
@@ -118,6 +121,8 @@ type scope struct {
 	global    *Global
 	variables map[string]types.Type
 	guarded   map[string]struct{} // set of field paths known non-nil (e.g. ".Foo.Bar")
+	declared  map[string]parse.Node // variables declared in this scope (name → declaration node)
+	used      map[string]struct{}   // variables read in this scope or child scopes
 }
 
 func (s *scope) child() *scope {
@@ -125,11 +130,26 @@ func (s *scope) child() *scope {
 		global:    s.global,
 		variables: maps.Clone(s.variables),
 		guarded:   make(map[string]struct{}, len(s.guarded)),
+		declared:  make(map[string]parse.Node),
+		used:      s.used, // share with parent so child uses bubble up
 	}
 	for k, v := range s.guarded {
 		c.guarded[k] = v
 	}
 	return c
+}
+
+// warnUnused emits W005 warnings for variables declared in this scope
+// that were never read.
+func (s *scope) warnUnused(tree *parse.Tree) {
+	if s.global.Warn == nil {
+		return
+	}
+	for name, node := range s.declared {
+		if _, ok := s.used[name]; !ok {
+			s.global.Warn(WarnUnusedVariable, tree, node, fmt.Sprintf("variable %s declared but not used", name))
+		}
+	}
 }
 
 // pipeFieldPath extracts the field path from a pipe expression.
@@ -213,6 +233,7 @@ func (s *scope) checkChainNode(tree *parse.Tree, dot, prev types.Type, n *parse.
 }
 
 func (s *scope) checkVariableNode(tree *parse.Tree, n *parse.VariableNode, args []types.Type) (types.Type, error) {
+	s.used[n.Ident[0]] = struct{}{}
 	tp, ok := s.variables[n.Ident[0]]
 	if !ok {
 		return nil, newError(tree, n, "variable %s not found", n.Ident[0])
@@ -244,7 +265,11 @@ func (s *scope) checkPipeNode(tree *parse.Tree, dot types.Type, n *parse.PipeNod
 		result = tp
 	}
 	if len(n.Decl) > 0 && len(n.Decl[0].Ident) > 0 {
-		s.variables[n.Decl[0].Ident[0]] = result
+		name := n.Decl[0].Ident[0]
+		s.variables[name] = result
+		if name != "$" {
+			s.declared[name] = n.Decl[0]
+		}
 	}
 	return result, nil
 }
@@ -261,11 +286,13 @@ func (s *scope) checkIfNode(tree *parse.Tree, dot types.Type, n *parse.IfNode) e
 	if _, err := ifScope.walk(tree, dot, nil, n.List); err != nil {
 		return err
 	}
+	ifScope.warnUnused(tree)
 	if n.ElseList != nil {
 		elseScope := s.child()
 		if _, err := elseScope.walk(tree, dot, nil, n.ElseList); err != nil {
 			return err
 		}
+		elseScope.warnUnused(tree)
 	}
 	return nil
 }
@@ -276,6 +303,7 @@ func (s *scope) checkWithNode(tree *parse.Tree, dot types.Type, n *parse.WithNod
 	if err != nil {
 		return err
 	}
+	child.warnUnused(tree)
 	withScope := child.child()
 	if path := pipeFieldPath(n.Pipe); path != "" {
 		withScope.guarded[path] = struct{}{}
@@ -285,11 +313,13 @@ func (s *scope) checkWithNode(tree *parse.Tree, dot types.Type, n *parse.WithNod
 	if _, err := withScope.walk(tree, x, nil, n.List); err != nil {
 		return err
 	}
+	withScope.warnUnused(tree)
 	if n.ElseList != nil {
 		elseScope := child.child()
 		if _, err := elseScope.walk(tree, dot, nil, n.ElseList); err != nil {
 			return err
 		}
+		elseScope.warnUnused(tree)
 	}
 	return nil
 }
@@ -349,8 +379,12 @@ func (s *scope) checkTemplateNode(tree *parse.Tree, dot types.Type, n *parse.Tem
 		variables: map[string]types.Type{
 			"$": x,
 		},
+		guarded:  make(map[string]struct{}),
+		declared: make(map[string]parse.Node),
+		used:     make(map[string]struct{}),
 	}
 	_, err := childScope.walk(childTree, x, nil, childTree.Root)
+	childScope.warnUnused(childTree)
 	return err
 }
 
@@ -569,6 +603,12 @@ func (s *scope) checkRangeNode(tree *parse.Tree, dot types.Type, n *parse.RangeN
 	if err != nil {
 		return err
 	}
+	// Range iteration variables are structural — don't warn if unused.
+	for _, decl := range n.Pipe.Decl {
+		if len(decl.Ident) > 0 {
+			delete(child.declared, decl.Ident[0])
+		}
+	}
 	pipeType = dereference(pipeType).Underlying()
 	var x types.Type
 	switch pt := pipeType.(type) {
@@ -642,10 +682,13 @@ func (s *scope) checkRangeNode(tree *parse.Tree, dot types.Type, n *parse.RangeN
 	if _, err := child.walk(tree, x, nil, n.List); err != nil {
 		return err
 	}
+	child.warnUnused(tree)
 	if n.ElseList != nil {
-		if _, err := child.walk(tree, x, nil, n.ElseList); err != nil {
+		elseScope := s.child()
+		if _, err := elseScope.walk(tree, x, nil, n.ElseList); err != nil {
 			return err
 		}
+		elseScope.warnUnused(tree)
 	}
 	return nil
 }
