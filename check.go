@@ -63,17 +63,23 @@ type Global struct {
 	// If nil, types are printed with their full package path.
 	// See types.WriteType for details.
 	Qualifier types.Qualifier
+
+	// subTemplateCallTypes records every data type a sub-template is
+	// invoked with via {{template "name" .Data}}, keyed by template name.
+	// Populated during Execute; used post-walk to detect W007.
+	subTemplateCallTypes map[string][]types.Type
 }
 
 type TemplateNodeInspectorFunc func(node *parse.TemplateNode, t *parse.Tree, tp types.Type)
 
 func NewGlobal(pkg *types.Package, fileSet *token.FileSet, trees TreeFinder, fnChecker CallChecker) *Global {
 	return &Global{
-		trees:           trees,
-		calls:           fnChecker,
-		pkg:             pkg,
-		fileSet:         fileSet,
-		typeNodeMapping: make(TypeNodeMapping),
+		trees:                trees,
+		calls:                fnChecker,
+		pkg:                  pkg,
+		fileSet:              fileSet,
+		typeNodeMapping:      make(TypeNodeMapping),
+		subTemplateCallTypes: make(map[string][]types.Type),
 	}
 }
 
@@ -412,6 +418,10 @@ func (s *scope) checkTemplateNode(tree *parse.Tree, dot types.Type, n *parse.Tem
 	}
 	if fn := s.global.InspectTemplateNode; fn != nil {
 		fn(n, tree, x)
+	}
+	// Record this call site's data type for post-walk W007 detection.
+	if s.global.subTemplateCallTypes != nil {
+		s.global.subTemplateCallTypes[n.Name] = append(s.global.subTemplateCallTypes[n.Name], x)
 	}
 	childTree, ok := s.global.trees.FindTree(n.Name)
 	if !ok {

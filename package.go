@@ -73,6 +73,12 @@ const (
 	// WarnDeadBranch indicates a conditional branch that can never execute
 	// because the condition is a literal true, false, or nil constant.
 	WarnDeadBranch
+
+	// WarnInconsistentTemplateTypes indicates that a sub-template is
+	// invoked from multiple {{template}} call sites with incompatible
+	// data types, which will produce different runtime behaviour depending
+	// on the caller.
+	WarnInconsistentTemplateTypes
 )
 
 // Code returns the short diagnostic code for the warning category (e.g. "W001").
@@ -550,6 +556,10 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		wrappedInspect = inspectTemplate
 	}
 
+	// subTemplateTypes accumulates every (templateName → dataType) pair seen
+	// across all {{template}} call sites, per receiver object, for W007.
+	subTemplateTypes := make(map[types.Object]map[string][]types.Type)
+
 	var errs []error
 	for _, p := range pending {
 		rt, ok := resolved[p.receiverObj]
@@ -585,6 +595,41 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		}
 		if err := Execute(global, looked.Tree(), p.dataType); err != nil {
 			errs = append(errs, err)
+		}
+		// Merge sub-template call types collected during this Execute run.
+		if warn != nil {
+			byName := subTemplateTypes[p.receiverObj]
+			if byName == nil {
+				byName = make(map[string][]types.Type)
+				subTemplateTypes[p.receiverObj] = byName
+			}
+			for name, tps := range global.subTemplateCallTypes {
+				byName[name] = append(byName[name], tps...)
+			}
+		}
+	}
+
+	// Warn about sub-templates called with incompatible types (W007).
+	if warn != nil {
+		for obj, byName := range subTemplateTypes {
+			pos := pkg.Fset.Position(obj.Pos())
+			names := make([]string, 0, len(byName))
+			for n := range byName {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				tps := byName[name]
+				if incompatibleTypes(tps) {
+					typeStrs := make([]string, len(tps))
+					for i, tp := range tps {
+						typeStrs[i] = types.TypeString(tp, nil)
+					}
+					warn(WarnInconsistentTemplateTypes, pos,
+						fmt.Sprintf("template %q is called with incompatible types: %s",
+							name, strings.Join(typeStrs, ", ")))
+				}
+			}
 		}
 	}
 
@@ -810,6 +855,37 @@ func packageDirectory(pkg *packages.Package) string {
 		return filepath.Dir(pkg.GoFiles[0])
 	}
 	return "."
+}
+
+// incompatibleTypes reports whether a slice of types contains at least two
+// types that are not mutually assignable. Types that carry no concrete
+// information (untyped nil, empty interface) are skipped.
+func incompatibleTypes(tps []types.Type) bool {
+	var concrete []types.Type
+	for _, tp := range tps {
+		if tp == nil {
+			continue
+		}
+		// Skip untyped nil — it can be passed to anything.
+		if basic, ok := tp.Underlying().(*types.Basic); ok && basic.Kind() == types.UntypedNil {
+			continue
+		}
+		// Skip empty interface — no structural information.
+		if isEmptyInterface(tp) {
+			continue
+		}
+		concrete = append(concrete, tp)
+	}
+	if len(concrete) < 2 {
+		return false
+	}
+	first := concrete[0]
+	for _, tp := range concrete[1:] {
+		if !types.AssignableTo(tp, first) && !types.AssignableTo(first, tp) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseLocation parses a "filename:line:col" string into a token.Position.
