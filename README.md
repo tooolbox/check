@@ -1,10 +1,12 @@
 # Check [![Go Reference](https://pkg.go.dev/badge/github.com/typelate/check.svg)](https://pkg.go.dev/github.com/typelate/check)
 
-**Check** is a Go library for statically type-checking `text/template` and `html/template`. It catches template/type mismatches early, making refactoring safer when changing types or templates.
+**Check** is a Go library and CLI for statically type-checking `text/template` and `html/template`. It catches template/type mismatches early, making refactoring safer when changing types or templates.
+
+It includes a [CLI](#check-templates-cli), a [gopls-compatible analyzer](#gopls-analyzer), and a [VS Code extension](#vs-code-extension).
 
 ## `check-templates` CLI
 
-If all your `ExecuteTemplate` calls use a string literal for the template name and a static type for the data argument, you can use the CLI directly:
+If all your `ExecuteTemplate` or `Execute` calls use a static type for the data argument, you can use the CLI directly:
 
 ```sh
 go get -tool github.com/typelate/check/cmd/check-templates
@@ -19,9 +21,9 @@ Flags:
 
 ### How the CLI discovers templates
 
-The CLI works by statically analyzing your Go source code. It traces each `ExecuteTemplate` call back to the variable that holds the `*template.Template`, then follows that variable's initialization chain to find the template files. This means:
+The CLI works by statically analyzing your Go source code. It traces each `ExecuteTemplate` and `Execute` call back to the variable that holds the `*template.Template`, then follows that variable's initialization chain to find the template files. This means:
 
-1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression will produce a warning (with `-w`) and be skipped.
+1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression will produce a warning (with `-w`) and be skipped. **`Execute`** calls are also supported &mdash; the template name is inferred from the receiver's root template.
 
 2. **Template initialization must use static arguments.** File paths passed to `ParseFiles`, glob patterns passed to `ParseGlob`, and embed patterns passed to `ParseFS` must all be string literals.
 
@@ -116,6 +118,45 @@ _ = templates.ExecuteTemplate(w, name, data)
 _ = templates.ExecuteTemplate(w, "index.gohtml", data)
 ```
 
+### Unused variables
+
+Variables declared with `$x := ...` that are never referenced in the template.
+
+```
+{{$x := .Title}}  {{/* $x is never used */}}
+<h1>{{.Title}}</h1>
+```
+
+### Dead conditional branches
+
+Branches with literal `true`, `false`, or `nil` conditions that can never execute.
+
+```
+{{if true}}always{{else}}never reached (W006){{end}}
+{{if false}}never reached (W006){{end}}
+```
+
+### Inconsistent sub-template types
+
+A sub-template invoked from multiple `{{template}}` call sites with incompatible data types.
+
+```
+{{template "header" .Page}}   {{/* passes Page */}}
+{{template "header" .Count}}  {{/* passes int — W007 */}}
+```
+
+### Warning reference
+
+| Code | Category |
+|------|----------|
+| W001 | Non-static `ExecuteTemplate` name |
+| W002 | Unused template |
+| W003 | Unguarded pointer dereference |
+| W004 | Interface field access |
+| W005 | Unused variable |
+| W006 | Dead conditional branch |
+| W007 | Inconsistent sub-template types |
+
 ## Errors
 
 These are type errors that `check-templates` reports regardless of the `-w` flag:
@@ -136,6 +177,36 @@ type Page struct { Title string }
 ### Type mismatch in template calls
 
 When `{{template "name" .}}` passes a type that doesn't match what the sub-template expects.
+
+### Printf format mismatch
+
+`{{printf "%d" .Name}}` where `.Name` is a string produces a type error. The tool validates that format verbs (`%d`, `%s`, `%f`, etc.) match the types of the corresponding arguments. `%v` accepts any type.
+
+## Gopls analyzer
+
+The `analyzer` package provides a `go/analysis.Analyzer` for use with gopls or `go vet -vettool=`. This gives real-time diagnostics at `ExecuteTemplate` call sites in `.go` files inside any editor that uses gopls (VS Code, GoLand, Vim, Emacs, etc.).
+
+```go
+import "github.com/typelate/check/analyzer"
+
+// analyzer.Analyzer is the go/analysis.Analyzer.
+```
+
+The analyzer wraps the same checking logic as the CLI. It supports a `-w` flag to enable warnings.
+
+> **Note:** The analyzer runs within the `go/analysis` framework, which does not provide access to `EmbedFiles` or cross-package deferred resolution. For complete coverage, use the standalone `check-templates` CLI. The analyzer is best suited for editor integration where real-time feedback is more important than exhaustive checking.
+
+## VS Code extension
+
+The `vscode-go-template-check` directory contains a VS Code extension that shows diagnostics **inside template files** (`.gohtml`, `.tmpl`, `.gotmpl`) &mdash; not just at Go call sites.
+
+Features:
+- Red squiggles on `{{.MissingField}}` in template files
+- Yellow squiggles for warnings (W001&ndash;W007)
+- Syntax highlighting for Go template directives in `.gohtml` files
+- Runs automatically on save
+
+The extension requires the `check-templates` binary on your `PATH`. See the [extension README](./vscode-go-template-check/README.md) for setup and configuration.
 
 ## Library usage
 
