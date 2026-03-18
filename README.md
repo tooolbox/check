@@ -2,7 +2,7 @@
 
 **Check** is a Go library and CLI for statically type-checking `text/template` and `html/template`. It catches template/type mismatches early, making refactoring safer when changing types or templates.
 
-It includes a [CLI](#check-templates-cli), a [gopls-compatible analyzer](#gopls-analyzer), and a [VS Code extension](#vs-code-extension).
+It includes a [CLI](#check-templates-cli) and a [VS Code extension](#vs-code-extension).
 
 ## `check-templates` CLI
 
@@ -181,20 +181,6 @@ When `{{template "name" .}}` passes a type that doesn't match what the sub-templ
 ### Printf format mismatch
 
 `{{printf "%d" .Name}}` where `.Name` is a string produces a type error. The tool validates that format verbs (`%d`, `%s`, `%f`, etc.) match the types of the corresponding arguments. `%v` accepts any type.
-
-## Gopls analyzer
-
-The `analyzer` package provides a `go/analysis.Analyzer` for use with gopls or `go vet -vettool=`. This gives real-time diagnostics at `ExecuteTemplate` call sites in `.go` files inside any editor that uses gopls (VS Code, GoLand, Vim, Emacs, etc.).
-
-```go
-import "github.com/typelate/check/analyzer"
-
-// analyzer.Analyzer is the go/analysis.Analyzer.
-```
-
-The analyzer wraps the same checking logic as the CLI. It supports a `-w` flag to enable warnings.
-
-> **Note:** The analyzer runs within the `go/analysis` framework, which does not provide access to `EmbedFiles` or cross-package deferred resolution. For complete coverage, use the standalone `check-templates` CLI. The analyzer is best suited for editor integration where real-time feedback is more important than exhaustive checking.
 
 ## VS Code extension
 
