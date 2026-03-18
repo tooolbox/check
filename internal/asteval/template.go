@@ -366,11 +366,17 @@ func parseFiles(t Template, pkgPath string, fm map[string]any, leftDelim, rightD
 		} else {
 			tmpl = t.New(templateName)
 		}
-		trees, err := parse.Parse(templateName, s, leftDelim, rightDelim, fm, builtins())
+		absoluteFilename, err := filepath.Abs(filename)
 		if err != nil {
 			return nil, err
 		}
-		absoluteFilename, err := filepath.Abs(filename)
+		trees, err := parse.Parse(templateName, s, leftDelim, rightDelim, fm, builtins())
+		if err != nil {
+			// parse.Parse errors use the template name (e.g. "template: index.gohtml:1: ...").
+			// Replace it with the absolute file path and reformat as "file:line:col: message"
+			// so the CLI and VS Code extension can parse the location.
+			return nil, normalizeParseError(err, templateName, absoluteFilename)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -382,6 +388,24 @@ func parseFiles(t Template, pkgPath string, fm map[string]any, leftDelim, rightD
 		}
 	}
 	return t, nil
+}
+
+// normalizeParseError rewrites a text/template/parse error from the form
+// "template: name:line: message" into "filepath:line:1: message (E001)" so
+// that the CLI output and VS Code extension can parse the location.
+func normalizeParseError(err error, templateName, absFilename string) error {
+	msg := err.Error()
+	prefix := "template: " + templateName + ":"
+	if !strings.HasPrefix(msg, prefix) {
+		return fmt.Errorf("%s:1:1: %s (E001)", absFilename, msg)
+	}
+	rest := msg[len(prefix):] // "3: unexpected ..."
+	if i := strings.Index(rest, ": "); i >= 0 {
+		line := rest[:i]
+		message := rest[i+2:]
+		return fmt.Errorf("%s:%s:1: %s (E001)", absFilename, line, message)
+	}
+	return fmt.Errorf("%s:1:1: %s (E001)", absFilename, msg)
 }
 
 func evaluateFuncMap(workingDirectory string, typesInfo *types.Info, pkg *types.Package, fileSet *token.FileSet, call *ast.CallExpr, fm map[string]any, funcTypesMap TemplateFunctions) error {
