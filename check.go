@@ -57,6 +57,11 @@ type Global struct {
 
 	InspectTemplateNode TemplateNodeInspectorFunc
 	InspectCallNode     ExecuteTemplateNodeInspectorFunc
+	// InspectActionNode is called after each template action's pipe is resolved.
+	// resolvedType is the final pipe result; inputType is the type of the first
+	// command in the pipe (before any functions are applied). They are equal
+	// when there is no pipe chain.
+	InspectActionNode func(node *parse.ActionNode, tree *parse.Tree, inputType, resolvedType types.Type)
 	Warn                WarningFunc
 
 	// Qualifier controls how types are printed in error messages.
@@ -257,8 +262,22 @@ func (s *scope) checkListNode(tree *parse.Tree, dot, prev types.Type, n *parse.L
 }
 
 func (s *scope) checkActionNode(tree *parse.Tree, dot, prev types.Type, n *parse.ActionNode) error {
-	_, err := s.walk(tree, dot, prev, n.Pipe)
-	return err
+	tp, err := s.walk(tree, dot, prev, n.Pipe)
+	if err != nil {
+		return err
+	}
+	if fn := s.global.InspectActionNode; fn != nil {
+		// Resolve the first command's type separately to capture the
+		// pre-pipe input type (e.g. []Item before | json).
+		inputType := tp
+		if n.Pipe != nil && len(n.Pipe.Cmds) > 1 {
+			if firstType, err := s.walk(tree, dot, nil, n.Pipe.Cmds[0]); err == nil {
+				inputType = firstType
+			}
+		}
+		fn(n, tree, inputType, tp)
+	}
+	return nil
 }
 
 func (s *scope) checkPipeNode(tree *parse.Tree, dot types.Type, n *parse.PipeNode) (types.Type, error) {

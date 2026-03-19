@@ -107,6 +107,15 @@ type DeferredCall struct {
 	ReceiverParamIdx int
 }
 
+// PackageOptions configures optional callbacks for package analysis.
+type PackageOptions struct {
+	InspectCall     ExecuteTemplateNodeInspectorFunc
+	InspectTemplate TemplateNodeInspectorFunc
+	InspectAction   func(node *parse.ActionNode, tree *parse.Tree, inputType, resolvedType types.Type)
+	Warn            PackageWarningFunc
+	Imported        []DeferredCall
+}
+
 // Package discovers all .ExecuteTemplate calls in the given package,
 // resolves receiver variables to their template construction chains,
 // and type-checks each call.
@@ -123,14 +132,26 @@ func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc
 // dependency packages and returns any new deferred calls discovered in this
 // package. This enables cross-package call-graph tracing.
 func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc, imported []DeferredCall) ([]DeferredCall, error) {
-	pending, receivers := findExecuteCalls(pkg, warn)
+	return PackageWithOptions(pkg, PackageOptions{
+		InspectCall:     inspectCall,
+		InspectTemplate: inspectTemplate,
+		Warn:            warn,
+		Imported:        imported,
+	})
+}
+
+// PackageWithOptions is like PackageWithDeferred but accepts an options struct,
+// which allows setting additional callbacks such as InspectAction for
+// TypeScript extraction.
+func PackageWithOptions(pkg *packages.Package, opts PackageOptions) ([]DeferredCall, error) {
+	pending, receivers := findExecuteCalls(pkg, opts.Warn)
 
 	// Resolve calls from imported packages' deferred wrappers.
-	if len(imported) > 0 {
-		pending = resolveImportedCalls(pkg, pending, receivers, imported)
+	if len(opts.Imported) > 0 {
+		pending = resolveImportedCalls(pkg, pending, receivers, opts.Imported)
 	}
 
-	pending = resolveCallGraph(pkg, pending, receivers, warn)
+	pending = resolveCallGraph(pkg, pending, receivers, opts.Warn)
 
 	// Collect deferred calls for exported functions before resolving templates.
 	var deferred []DeferredCall
@@ -158,7 +179,7 @@ func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeI
 		deferred[i].resolved = resolved
 	}
 
-	callErr := checkCalls(pkg, resolvedPending, resolved, inspectCall, inspectTemplate, warn)
+	callErr := checkCalls(pkg, resolvedPending, resolved, opts)
 	return deferred, errors.Join(append(resolveErrs, callErr)...)
 }
 
@@ -516,7 +537,10 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 
 // checkCalls type-checks each pending ExecuteTemplate call against its
 // resolved template.
-func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
+func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, opts PackageOptions) error {
+	inspectCall := opts.InspectCall
+	inspectTemplate := opts.InspectTemplate
+	warn := opts.Warn
 	mergedFunctions := make(Functions)
 	if pkg.Types != nil {
 		mergedFunctions = DefaultFunctions(pkg.Types)
@@ -584,6 +608,7 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		}
 		global := NewGlobal(pkg.Types, pkg.Fset, rt.templates, mergedFunctions)
 		global.InspectTemplateNode = wrappedInspect
+		global.InspectActionNode = opts.InspectAction
 		if warn != nil {
 			global.Warn = func(cat WarningCategory, tree *parse.Tree, node parse.Node, message string) {
 				loc, _ := tree.ErrorContext(node)

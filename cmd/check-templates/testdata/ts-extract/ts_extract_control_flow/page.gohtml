@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<body>
+<script>
+  const title = {{.Title}};
+  {{if .Debug}}
+  console.log("debug level:", {{.LogLevel}});
+  {{end}}
+  document.title = title;
+</script>
+</body>
+</html>
