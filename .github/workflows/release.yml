@@ -39,7 +39,8 @@ jobs:
           EXT=""
           if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
           OUTPUT="check-templates-${GOOS}-${GOARCH}${EXT}"
-          go build -o "$OUTPUT" ./cmd/check-templates
+          VERSION="${{ github.event.release.tag_name }}"
+          go build -ldflags "-X main.version=${VERSION}" -o "$OUTPUT" ./cmd/check-templates
 
       - name: Upload release asset
         env:

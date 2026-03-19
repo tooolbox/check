@@ -5,7 +5,7 @@ import (
 	textTemplate "text/template"
 	"text/template/parse"
 
-	"github.com/typelate/check"
+	"github.com/tooolbox/check"
 )
 
 func findTextTemplateTree(tmpl *textTemplate.Template) check.FindTreeFunc {

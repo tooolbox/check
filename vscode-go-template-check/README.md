@@ -20,7 +20,7 @@ extension will prompt you to install it.
 **Manual install:**
 
 ```sh
-go install github.com/typelate/check/cmd/check-templates@latest
+go install github.com/tooolbox/check/cmd/check-templates@latest
 ```
 
 Go 1.21 or later is required.

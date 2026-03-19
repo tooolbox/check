@@ -1,4 +1,4 @@
-module github.com/typelate/check
+module github.com/tooolbox/check
 
 go 1.25
 

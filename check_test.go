@@ -21,7 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/tools/go/packages"
 
-	"github.com/typelate/check"
+	"github.com/tooolbox/check"
 )
 
 const packageName = "check_test"

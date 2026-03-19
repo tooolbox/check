@@ -6,7 +6,7 @@ import (
 	"go/token"
 	"strconv"
 
-	"github.com/typelate/check/internal/astgen"
+	"github.com/tooolbox/check/internal/astgen"
 )
 
 func StringLiteralExpression(wd string, set *token.FileSet, exp ast.Expr) (string, error) {

@@ -44,7 +44,7 @@ function checkBinaryInstalled(): void {
 			).then((choice) => {
 				if (choice === 'Install') {
 					const term = vscode.window.createTerminal('Go Template Check Install');
-					term.sendText('go install github.com/typelate/check/cmd/check-templates@latest');
+					term.sendText('go install github.com/tooolbox/check/cmd/check-templates@latest');
 					term.show();
 				}
 			});

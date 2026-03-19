@@ -14,8 +14,8 @@ import (
 
 	"golang.org/x/tools/go/packages"
 
-	"github.com/typelate/check/internal/asteval"
-	"github.com/typelate/check/internal/astgen"
+	"github.com/tooolbox/check/internal/asteval"
+	"github.com/tooolbox/check/internal/astgen"
 )
 
 type pendingCall struct {

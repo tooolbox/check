@@ -1,4 +1,4 @@
-# Check [![Go Reference](https://pkg.go.dev/badge/github.com/typelate/check.svg)](https://pkg.go.dev/github.com/typelate/check)
+# Check [![Go Reference](https://pkg.go.dev/badge/github.com/tooolbox/check.svg)](https://pkg.go.dev/github.com/tooolbox/check)
 
 **Check** is a Go library and CLI for statically type-checking `text/template` and `html/template`. It catches template/type mismatches early, making refactoring safer when changing types or templates.
 
@@ -9,7 +9,7 @@ It includes a [CLI](#check-templates-cli) and a [VS Code extension](#vs-code-ext
 If all your `ExecuteTemplate` or `Execute` calls use a static type for the data argument, you can use the CLI directly:
 
 ```sh
-go get -tool github.com/typelate/check/cmd/check-templates
+go get -tool github.com/tooolbox/check/cmd/check-templates
 go tool check-templates ./...
 ```
 

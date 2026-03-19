@@ -16,10 +16,16 @@ import (
 
 	"golang.org/x/tools/go/packages"
 
-	"github.com/typelate/check"
+	"github.com/tooolbox/check"
 )
 
+var version = "(dev)"
+
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version" {
+		fmt.Println("check-templates " + version)
+		return
+	}
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Fatalln(err)

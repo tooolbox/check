@@ -13,7 +13,7 @@ import (
 	"text/template/parse"
 	"unicode"
 
-	"github.com/typelate/check/internal/astgen"
+	"github.com/tooolbox/check/internal/astgen"
 )
 
 // Template abstracts over html/template.Template and text/template.Template
