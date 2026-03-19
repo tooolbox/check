@@ -75,6 +75,8 @@ jobs:
       - name: Build .vsix
         working-directory: vscode-go-template-check
         run: |
+          VERSION="${{ github.ref_name }}"
+          npm version "${VERSION#v}" --no-git-tag-version
           npm ci
           npx @vscode/vsce package --no-git-tag-version
 
