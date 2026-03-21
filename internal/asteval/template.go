@@ -3,6 +3,7 @@ package asteval
 import (
 	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/token"
 	"go/types"
 	"os"
@@ -667,14 +668,43 @@ type TemplateFunctions map[string]*types.Signature
 
 func DefaultFunctions(pkg *types.Package) TemplateFunctions {
 	funcTypeMap := make(TemplateFunctions)
-	fmtPkg, ok := findPackage(pkg, "fmt")
-	if !ok || fmtPkg == nil {
+	fmtPkg := loadPackage(pkg, "fmt")
+	if fmtPkg == nil {
 		return funcTypeMap
 	}
-	funcTypeMap["printf"] = fmtPkg.Scope().Lookup("Sprintf").Type().(*types.Signature)
-	funcTypeMap["print"] = fmtPkg.Scope().Lookup("Sprint").Type().(*types.Signature)
-	funcTypeMap["println"] = fmtPkg.Scope().Lookup("Sprintln").Type().(*types.Signature)
+	for goName, tmplName := range map[string]string{
+		"Sprintf":  "printf",
+		"Sprint":   "print",
+		"Sprintln": "println",
+	} {
+		obj := fmtPkg.Scope().Lookup(goName)
+		if obj == nil {
+			continue
+		}
+		if sig, ok := obj.Type().(*types.Signature); ok {
+			funcTypeMap[tmplName] = sig
+		}
+	}
 	return funcTypeMap
+}
+
+// loadPackage finds a package by import path, first searching the import graph
+// of pkg, then falling back to go/importer for standard library packages that
+// may only be transitively imported (and thus have incomplete scopes).
+func loadPackage(pkg *types.Package, path string) *types.Package {
+	if p, ok := findPackage(pkg, path); ok && p != nil {
+		// Check that the scope is actually populated. Transitive imports
+		// loaded without NeedDeps may have empty scopes.
+		if p.Scope().Len() > 0 {
+			return p
+		}
+	}
+	// Fall back to go/importer for standard library packages.
+	p, err := importer.Default().Import(path)
+	if err != nil {
+		return nil
+	}
+	return p
 }
 
 func findPackage(pkg *types.Package, path string) (*types.Package, bool) {

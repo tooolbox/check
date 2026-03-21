@@ -2,7 +2,6 @@ package main
 
 import (
 	"embed"
-	"fmt"
 	"html/template"
 	"net/http"
 )
@@ -26,5 +25,3 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		Items: []Item{{Name: "Widget", Price: 9.99}},
 	})
 }
-
-var _ = fmt.Sprint
