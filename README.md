@@ -17,7 +17,7 @@ Flags:
 - `-v` &mdash; list each call with position, template name, and data type
 - `-w` &mdash; enable warnings for potential issues (see [Warnings](#warnings) below)
 - `-C dir` &mdash; change working directory before loading packages
-- `-o format` &mdash; output format: `tsv` (default) or `jsonl`
+- `-o format` &mdash; output format: `tsv` (default), `jsonl`, `ts-extract`, or `ts-check`
 
 ### How the CLI discovers templates
 
@@ -156,6 +156,7 @@ A sub-template invoked from multiple `{{template}}` call sites with incompatible
 | W005 | Unused variable |
 | W006 | Dead conditional branch |
 | W007 | Inconsistent sub-template types |
+| W008 | Non-scalar type injected into `<script>` without JSON serialization |
 
 ## Errors
 
@@ -193,6 +194,110 @@ Features:
 - Runs automatically on save
 
 The extension requires the `check-templates` binary on your `PATH`. See the [extension README](./vscode-go-template-check/README.md) for setup and configuration.
+
+## TypeScript checking for inline `<script>` blocks
+
+Go templates often embed JavaScript inside `<script>` blocks, injecting Go values via `{{.Field}}` expressions. These values are invisible to the TypeScript compiler, so type errors in the JavaScript are only caught at runtime.
+
+`check-templates` can extract these script blocks, generate typed TypeScript, and type-check them in-process &mdash; no external `tsc` or Node.js required.
+
+### Quick start
+
+```sh
+# Type-check Go templates AND their inline JavaScript:
+go tool check-templates -o ts-check ./...
+```
+
+This will report both Go template type errors and TypeScript type errors, with all diagnostics mapped back to the original `.gohtml` file locations.
+
+### How it works
+
+1. `<script>` blocks are extracted from templates
+2. `{{.Field}}` expressions are replaced with typed TypeScript placeholders based on the Go type
+3. The TypeScript compiler (embedded via [typescript-go](https://github.com/microsoft/typescript-go)) type-checks the generated code in-process using an in-memory virtual filesystem
+4. Diagnostics are mapped back to the original template line and column
+
+### Example
+
+Given this Go code and template:
+
+```go
+type Item struct {
+    Name  string
+    Price float64
+}
+
+type PageData struct {
+    Items []Item
+}
+
+func toJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
+
+var funcs = template.FuncMap{"toJSON": toJSON}
+var templates = template.Must(template.New("").Funcs(template.FuncMap{"toJSON": toJSON}).ParseFS(source, "*.gohtml"))
+```
+
+```html
+<script>
+  const items = JSON.parse({{.Items | toJSON}});
+  const total = items.map(d => d + 1);  // type error!
+</script>
+```
+
+Running `check-templates -o ts-check ./...` produces:
+
+```
+index.gohtml:3:32: Operator '+' cannot be applied to types '{ Name: string; Price: number; }' and 'number'. (TS2365)
+```
+
+### Output modes
+
+| Mode | Flag | What it does |
+|------|------|-------------|
+| **ts-check** | `-o ts-check` | Extract + type-check in-process, report diagnostics to stderr |
+| **ts-extract** | `-o ts-extract` | Extract only, write `.ts` files to disk (for manual `tsc` runs) |
+
+### Type mapping
+
+Go types are mapped to TypeScript types automatically:
+
+| Go type | TypeScript type |
+|---------|-----------------|
+| `string` | `string` |
+| `int`, `float64`, etc. | `number` |
+| `bool` | `boolean` |
+| `[]T` | `Array<T>` |
+| `map[K]V` | `Record<K, V>` |
+| `struct { ... }` | `{ Field: Type; ... }` |
+| `*T` | `T \| null` |
+| `interface{}` / `any` | `unknown` |
+| `time.Time` | `string` (RFC 3339) |
+
+Struct fields follow `json` tag rules (`json:"name"`, `json:"-"`, `json:",omitempty"`).
+
+### Branded types for DOM data channels
+
+When Go templates inject data through HTML elements other than inline `<script>`, the tool generates [branded TypeScript types](./DESIGN-TS-EXTRACT.md#branded-types-for-script-typeapplicationjson-blocks) so that `getElementById`, `querySelector`, and `JSON.parse` return correctly typed values:
+
+| HTML pattern | TypeScript overload |
+|-------------|-------------------|
+| `<script type="application/json" id="x">{{.Data \| toJSON}}</script>` | `getElementById("x")` returns element with `textContent: JSONString<DataType>` |
+| `<div id="x" data-config='{{.Cfg \| toJSON}}'>` | `getElementById("x")` returns element with `dataset: { config: JSONString<CfgType> }` |
+| `<meta name="x" content="{{.Token}}">` | `querySelector('meta[name="x"]')` returns element with typed `content` |
+| `<input type="hidden" id="x" value='{{.Data \| toJSON}}'>` | `getElementById("x")` returns element with `value: JSONString<DataType>` |
+
+The `JSONString<T>` branded type threads through `JSON.parse` so that `JSON.parse(el.textContent)` returns `T` instead of `any`.
+
+### Non-serialized injection
+
+Injecting a non-scalar Go type (struct, slice, map) into a `<script>` block without JSON serialization (e.g. `{{.Items}}` instead of `{{.Items | toJSON}}`) produces Go's `%v` format, which is not valid JavaScript. The tool:
+
+- Emits warning **W008** about the non-serialized injection
+- Types the value as `unknown` in the TypeScript output (since the runtime value is garbage)
+
+| Code | Category |
+|------|----------|
+| W008 | Non-scalar type injected without JSON serialization |
 
 ## Library usage
 
