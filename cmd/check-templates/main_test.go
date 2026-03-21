@@ -146,6 +146,62 @@ func TestTSExtract(t *testing.T) {
 	}
 }
 
+// TestTSCheck runs check-templates -o ts-check against real Go + template
+// files and verifies that TypeScript diagnostics are surfaced and mapped
+// back to the template source.
+func TestTSCheck(t *testing.T) {
+	checkDir := filepath.Join("testdata", "ts-check")
+	entries, err := os.ReadDir(checkDir)
+	if err != nil {
+		t.Fatalf("reading ts-check dir: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		dir := filepath.Join(checkDir, name)
+
+		t.Run(name, func(t *testing.T) {
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				t.Fatalf("abs path: %v", err)
+			}
+
+			// Read the fixture spec if present.
+			specPath := filepath.Join(dir, "fixture.json")
+			var spec fixtureSpec
+			if data, err := os.ReadFile(specPath); err == nil {
+				if err := json.Unmarshal(data, &spec); err != nil {
+					t.Fatalf("parsing fixture.json: %v", err)
+				}
+			} else {
+				// Default: expect exit code 1 (diagnostics found).
+				spec.WantExitCode = 1
+			}
+
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"-o", "ts-check"}, spec.Flags...)
+			args = append(args, "./...")
+			gotCode := run(absDir, args, &stdout, &stderr)
+
+			stderrStr := filepath.ToSlash(stderr.String())
+			t.Logf("stderr:\n%s", stderrStr)
+
+			if gotCode != spec.WantExitCode {
+				t.Errorf("exit code: got %d, want %d\nstderr:\n%s", gotCode, spec.WantExitCode, stderrStr)
+			}
+
+			for _, want := range spec.WantStderr {
+				if !strings.Contains(stderrStr, want) {
+					t.Errorf("stderr missing %q\nfull stderr:\n%s", want, stderrStr)
+				}
+			}
+		})
+	}
+}
+
 func checkTemplatesCommand() script.Cmd {
 	return script.Command(script.CmdUsage{
 		Summary: "check-templates [dir]",

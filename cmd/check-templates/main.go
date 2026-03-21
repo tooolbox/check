@@ -18,6 +18,7 @@ import (
 	"golang.org/x/tools/go/packages"
 
 	"github.com/tooolbox/check"
+	"github.com/tooolbox/check/tscheck"
 	"github.com/tooolbox/check/tsextract"
 )
 
@@ -47,7 +48,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 	flagSet.BoolVar(&verbose, "v", false, "show all calls")
 	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unguarded pointer access, unused templates)")
 	flagSet.StringVar(&dir, "C", dir, "change directory")
-	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv, jsonl, or ts-extract")
+	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv, jsonl, ts-extract, or ts-check")
 	flagSet.StringVar(&tsOutDir, "ts-outdir", "", "output directory for ts-extract (default: next to template)")
 	if err := flagSet.Parse(args); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -55,7 +56,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch outputFormat {
-	case "tsv", "jsonl", "ts-extract":
+	case "tsv", "jsonl", "ts-extract", "ts-check":
 	default:
 		_, _ = fmt.Fprintf(stderr, "unsupported output format: %s\n", outputFormat)
 		return 1
@@ -63,6 +64,9 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 
 	if outputFormat == "ts-extract" {
 		return runTSExtract(dir, flagSet.Args(), tsOutDir, warn, stdout, stderr)
+	}
+	if outputFormat == "ts-check" {
+		return runTSCheck(dir, flagSet.Args(), warn, stdout, stderr)
 	}
 
 	if !verbose {
@@ -230,6 +234,114 @@ func runTSExtract(dir string, extraArgs []string, tsOutDir string, enableWarn bo
 
 	if filesWritten > 0 {
 		_, _ = fmt.Fprintf(stderr, "ts-extract: wrote %d file(s)\n", filesWritten)
+	}
+
+	return exitCode
+}
+
+func runTSCheck(dir string, extraArgs []string, enableWarn bool, stdout, stderr io.Writer) int {
+	loadArgs := []string{"."}
+	if len(extraArgs) > 0 {
+		loadArgs = extraArgs
+	}
+
+	fset := token.NewFileSet()
+	pkgs, err := packages.Load(&packages.Config{
+		Fset: fset,
+		Mode: packages.NeedTypesInfo | packages.NeedName | packages.NeedFiles |
+			packages.NeedTypes | packages.NeedSyntax | packages.NeedEmbedPatterns |
+			packages.NeedEmbedFiles | packages.NeedImports | packages.NeedModule,
+		Dir: dir,
+	}, loadArgs...)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "failed to load packages: %v\n", err)
+		return 1
+	}
+
+	exitCode := 0
+
+	// Collect {tree → map[*ActionNode]ActionTypes} during the Execute walk.
+	treeActions := make(map[*parse.Tree]map[*parse.ActionNode]tsextract.ActionTypes)
+	var allDeferred []check.DeferredCall
+
+	for _, pkg := range pkgs {
+		for _, e := range pkg.Errors {
+			_, _ = fmt.Fprintln(stderr, e)
+			exitCode = 1
+		}
+
+		var warnFunc check.PackageWarningFunc
+		if enableWarn {
+			warnFunc = func(cat check.WarningCategory, pos token.Position, message string) {
+				_, _ = fmt.Fprintf(stderr, "%s: %s (%s)\n", pos, message, cat.Code())
+			}
+		}
+
+		deferred, err := check.PackageWithOptions(pkg, check.PackageOptions{
+			InspectAction: func(node *parse.ActionNode, tree *parse.Tree, inputType, resolvedType types.Type) {
+				m, ok := treeActions[tree]
+				if !ok {
+					m = make(map[*parse.ActionNode]tsextract.ActionTypes)
+					treeActions[tree] = m
+				}
+				m[node] = tsextract.ActionTypes{InputType: inputType, ResolvedType: resolvedType}
+			},
+			Warn:     warnFunc,
+			Imported: allDeferred,
+		})
+		if err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			exitCode = 1
+		}
+		allDeferred = append(allDeferred, deferred...)
+	}
+
+	// Extract script blocks and build FileEntry list for tscheck.
+	var entries []tscheck.FileEntry
+	for tree, actions := range treeActions {
+		result, err := tsextract.Extract(tree, actions)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "ts-check: %s: %v\n", tree.ParseName, err)
+			exitCode = 1
+			continue
+		}
+		if result == nil || len(result.ScriptBlocks) == 0 {
+			continue
+		}
+
+		// Emit extraction warnings to stderr.
+		for _, block := range result.ScriptBlocks {
+			for _, w := range block.Warnings {
+				_, _ = fmt.Fprintf(stderr, "%s:%d: %s\n", tree.ParseName, block.StartLine, w)
+			}
+		}
+
+		content := tsextract.FormatTSFile(filepath.Base(tree.ParseName), tree.ParseName, result)
+
+		// Use a virtual path based on the template name.
+		virtualPath := "/" + filepath.ToSlash(filepath.Base(tree.ParseName)) + ".ts"
+		entries = append(entries, tscheck.FileEntry{
+			VirtualPath: virtualPath,
+			Content:     content,
+			Result:      result,
+		})
+	}
+
+	if len(entries) == 0 {
+		return exitCode
+	}
+
+	// Run the TypeScript type checker.
+	checkResult, err := tscheck.Check(entries)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "ts-check: %v\n", err)
+		return 1
+	}
+
+	for _, d := range checkResult.Diagnostics {
+		_, _ = fmt.Fprintf(stderr, "%s:%d:%d: %s (TS%d)\n",
+			d.TemplateFile, d.Line, d.Col, d.Message, d.Code)
+		exitCode = 1
 	}
 
 	return exitCode
