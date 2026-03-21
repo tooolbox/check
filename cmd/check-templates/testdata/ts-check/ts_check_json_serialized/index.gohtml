@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+<head><title>Shop</title></head>
+<body>
+<script>
+  const items = JSON.parse({{.Items | toJSON}});
+  const total = items.map(d => d + 1);
+  console.log(total);
+</script>
+</body>
+</html>

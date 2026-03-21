@@ -1,6 +1,6 @@
 {
-  "wantExitCode": 1,
+  "wantExitCode": 0,
   "wantStderr": [
-    "index.gohtml"
+    "W008"
   ]
 }

@@ -1,0 +1,8 @@
+{
+  "wantExitCode": 1,
+  "wantStderr": [
+    "TS2365",
+    "index.gohtml",
+    "Operator '+' cannot be applied"
+  ]
+}

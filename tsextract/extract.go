@@ -412,12 +412,16 @@ func Extract(tree *parse.Tree, actions map[*parse.ActionNode]ActionTypes) (*Extr
 						}
 					}
 				}
+			} else if isNonScalar(at.ResolvedType) {
+				// Non-scalar without JSON serialisation produces Go's %v
+				// format, not valid JS. Type as 'unknown' to avoid misleading
+				// type errors on what is essentially garbage output.
+				warnings = append(warnings, fmt.Sprintf(
+					"non-scalar type %s injected into <script> without JSON serialisation; output will be Go's %%v format, not valid JS (W008)",
+					at.ResolvedType))
+				find = marker
+				repl = "(undefined! as unknown)"
 			} else {
-				if isNonScalar(at.ResolvedType) {
-					warnings = append(warnings, fmt.Sprintf(
-						"non-scalar type %s injected into <script> without JSON serialisation; output will be Go's %%v format, not valid JS (W008)",
-						at.ResolvedType))
-				}
 				find = marker
 				tsType := GoTypeToTS(at.ResolvedType)
 				repl = fmt.Sprintf("(undefined! as %s)", tsType)

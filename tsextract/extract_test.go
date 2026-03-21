@@ -58,8 +58,9 @@ func TestExtractScriptBlocks(t *testing.T) {
 	}
 
 	block := result.ScriptBlocks[0]
-	if !strings.Contains(block.TypeScript, `(undefined! as Array<{ Name: string; Price: number }>)`) {
-		t.Errorf("expected Items placeholder, got:\n%s", block.TypeScript)
+	// Non-scalar type injected without JSON serialisation should be typed as 'unknown'.
+	if !strings.Contains(block.TypeScript, `(undefined! as unknown)`) {
+		t.Errorf("expected non-scalar Items to be typed as 'unknown', got:\n%s", block.TypeScript)
 	}
 	if strings.Contains(block.TypeScript, "{{") {
 		t.Errorf("template actions should not appear in output:\n%s", block.TypeScript)
