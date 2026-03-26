@@ -32,16 +32,37 @@ type pendingCall struct {
 	// nameParamIdx >= 0 means the template name comes from a function parameter.
 	// dataParamIdx >= 0 means the data type comes from a function parameter.
 	// receiverParamIdx >= 0 means the template receiver comes from a function parameter.
+	// mapKeyParamIdx >= 0 means the receiver came from a map index where the
+	// key is a function parameter (e.g. t, ok := templates[name]).
 	nameParamIdx     int
 	dataParamIdx     int
 	receiverParamIdx int
+	mapKeyParamIdx   int
 	enclosingFunc    types.Object
+
+	// mapKey is the resolved map index key when the receiver came from a
+	// map lookup (e.g. templates[name] where name = "workbench/receiving.html").
+	// Used to select the correct per-page template set.
+	mapKey string
 }
 
 type resolvedTemplate struct {
 	templates asteval.Template
 	functions asteval.TemplateFunctions
 	metadata  *asteval.TemplateMetadata
+}
+
+// resolvedTemplateSet wraps a resolvedTemplate with optional per-key
+// variants for map-based template patterns. When byKey is non-nil,
+// callers should look up a specific key to get a scoped template set
+// that only contains the templates for that specific page.
+type resolvedTemplateSet struct {
+	// single is the default (merged) template set, used when there is no
+	// per-key scoping or when the mapKey is not found in byKey.
+	single *resolvedTemplate
+	// byKey maps page keys to per-page template sets. Only populated when
+	// the receiver came from a for-range loop storing templates into a map.
+	byKey map[string]*resolvedTemplate
 }
 
 type ExecuteTemplateNodeInspectorFunc func(node *ast.CallExpr, t *parse.Tree, tp types.Type)
@@ -95,7 +116,7 @@ type PackageWarningFunc func(category WarningCategory, pos token.Position, messa
 // other packages may provide the concrete values via call-graph tracing.
 type DeferredCall struct {
 	pendingCall
-	resolved map[types.Object]*resolvedTemplate
+	resolved map[types.Object]*resolvedTemplateSet
 
 	// FuncObj is the exported function that wraps the ExecuteTemplate call.
 	FuncObj types.Object
@@ -367,11 +388,31 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 			}
 
 			// Check if the receiver is a function parameter.
+			mapKeyParamIdx := -1
 			idx, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, receiverIdent)
 			if isParam {
 				receiverParamIdx = idx
 				if enclosingFunc == nil {
 					enclosingFunc = fObj
+				}
+			} else {
+				// The receiver may come from a map index (t, ok := templates[name]).
+				// If the map key is a function parameter, capture it so we can
+				// resolve it to the specific page key at each call site.
+				mapKeyParamIdx = detectMapKeyParam(pkg.TypesInfo, pkg.Syntax, obj)
+				if mapKeyParamIdx >= 0 && enclosingFunc == nil {
+					// Find the enclosing function for call graph resolution.
+					_, fObj, isParam := asteval.IsFuncParam(pkg.TypesInfo, pkg.Syntax, receiverIdent)
+					if isParam {
+						enclosingFunc = fObj
+					} else {
+						// The receiver itself isn't a param, but the map key is.
+						// Find the enclosing closure/func for the map key param.
+						fl := asteval.FindEnclosingFuncLit(pkg.Syntax, receiverIdent.Pos())
+						if fl != nil {
+							enclosingFunc = asteval.FuncLitVarObj(pkg.TypesInfo, pkg.Syntax, fl)
+						}
+					}
 				}
 			}
 
@@ -383,6 +424,7 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 				nameParamIdx:     nameParamIdx,
 				dataParamIdx:     dataParamIdx,
 				receiverParamIdx: receiverParamIdx,
+				mapKeyParamIdx:   mapKeyParamIdx,
 				enclosingFunc:    enclosingFunc,
 			})
 			receiverSet[obj] = struct{}{}
@@ -395,8 +437,8 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 
 // resolveTemplates resolves each unique receiver object to its template
 // construction chain, including additional ParseFS/Parse modifications.
-func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}, allPkgs []*packages.Package) (map[types.Object]*resolvedTemplate, []error) {
-	resolved := make(map[types.Object]*resolvedTemplate)
+func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}, allPkgs []*packages.Package) (map[types.Object]*resolvedTemplateSet, []error) {
+	resolved := make(map[types.Object]*resolvedTemplateSet)
 
 	workingDirectory := packageDirectory(pkg)
 	moduleRoot := ""
@@ -418,7 +460,9 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 		// If the defining expression is a map index (e.g. t, ok := templates[name]),
 		// trace through the map to find where values are stored into it.
 		var sliceCtx *asteval.SliceEvalContext
-		expr, sliceCtx = traceMapIndex(pkg.TypesInfo, pkg.Syntax, expr, workingDirectory, moduleRoot, allPkgs)
+		var storeInfo *mapStoreInfo
+		expr, sliceCtx, storeInfo = traceMapIndex(pkg.TypesInfo, pkg.Syntax, expr, workingDirectory, moduleRoot, allPkgs)
+		_ = storeInfo // used later for per-key template resolution
 
 		// Only attempt resolution if the expression is a call. Non-call
 		// expressions (e.g. unresolved map lookups, function returns that
@@ -428,6 +472,44 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 			return
 		}
 
+		rts := &resolvedTemplateSet{}
+
+		// If the template was stored inside a for-range loop, build per-key
+		// template sets so each page gets its own scoped template set.
+		if storeInfo != nil && storeInfo.rangeVar != nil && sliceCtx != nil {
+			pageFiles, ok := asteval.ResolveStringSliceExpr(sliceCtx, storeInfo.rangeExpr)
+			if ok && len(pageFiles) > 0 {
+				byKey := make(map[string]*resolvedTemplate)
+				for _, pageFile := range pageFiles {
+					if !filepath.IsAbs(pageFile) {
+						pageFile = filepath.Join(sliceCtx.WorkingDirectory, pageFile)
+					}
+					perPageCtx := sliceCtx.WithBinding(storeInfo.rangeVar, pageFile)
+					perMeta := &asteval.TemplateMetadata{}
+					perFuncs := asteval.DefaultFunctions(pkg.Types)
+					perTS, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, perFuncs, make(map[string]any), perMeta, perPageCtx)
+					if err != nil {
+						continue
+					}
+					mapKey, ok := perPageCtx.ResolveString(storeInfo.keyExpr)
+					if !ok {
+						continue
+					}
+					byKey[mapKey] = &resolvedTemplate{
+						templates: perTS,
+						functions: perFuncs,
+						metadata:  perMeta,
+					}
+				}
+				if len(byKey) > 0 {
+					rts.byKey = byKey
+					resolved[obj] = rts
+					return
+				}
+			}
+		}
+
+		// Standard single-set resolution (non-loop or fallback).
 		funcTypeMap := asteval.DefaultFunctions(pkg.Types)
 		meta := &asteval.TemplateMetadata{}
 		ts, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, funcTypeMap, make(map[string]any), meta, sliceCtx)
@@ -435,11 +517,12 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 			resolveErrs = append(resolveErrs, err)
 			return
 		}
-		resolved[obj] = &resolvedTemplate{
+		rts.single = &resolvedTemplate{
 			templates: ts,
 			functions: funcTypeMap,
 			metadata:  meta,
 		}
+		resolved[obj] = rts
 	}
 
 	// Resolve top-level var declarations.
@@ -519,14 +602,17 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 			if !ok {
 				return true
 			}
+			if rt.single == nil {
+				return true
+			}
 			meta := &asteval.TemplateMetadata{}
-			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.functions, make(map[string]any), meta, nil)
+			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.single.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.single.functions, make(map[string]any), meta, nil)
 			if err != nil {
 				return true
 			}
-			rt.templates = ts
-			rt.metadata.EmbedFilePaths = append(rt.metadata.EmbedFilePaths, meta.EmbedFilePaths...)
-			rt.metadata.ParseCalls = append(rt.metadata.ParseCalls, meta.ParseCalls...)
+			rt.single.templates = ts
+			rt.single.metadata.EmbedFilePaths = append(rt.single.metadata.EmbedFilePaths, meta.EmbedFilePaths...)
+			rt.single.metadata.ParseCalls = append(rt.single.metadata.ParseCalls, meta.ParseCalls...)
 			return true
 		})
 	}
@@ -536,14 +622,16 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 
 // checkCalls type-checks each pending ExecuteTemplate call against its
 // resolved template.
-func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplate, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
+func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplateSet, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
 	mergedFunctions := make(Functions)
 	if pkg.Types != nil {
 		mergedFunctions = DefaultFunctions(pkg.Types)
 	}
-	for _, rt := range resolved {
-		for name, sig := range rt.functions {
-			mergedFunctions[name] = sig
+	for _, rts := range resolved {
+		if rts.single != nil {
+			for name, sig := range rts.single.functions {
+				mergedFunctions[name] = sig
+			}
 		}
 	}
 
@@ -556,11 +644,11 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 		wrappedInspect = func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
 			// Find which receiver this tree belongs to and record the reference.
 			for _, p := range pending {
-				rt, ok := resolved[p.receiverObj]
-				if !ok {
+				rts, ok := resolved[p.receiverObj]
+				if !ok || rts.single == nil {
 					continue
 				}
-				if _, found := rt.templates.FindTree(node.Name); found {
+				if _, found := rts.single.templates.FindTree(node.Name); found {
 					if referenced[p.receiverObj] == nil {
 						referenced[p.receiverObj] = make(map[string]struct{})
 					}
@@ -582,8 +670,19 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 
 	var errs []error
 	for _, p := range pending {
-		rt, ok := resolved[p.receiverObj]
+		rts, ok := resolved[p.receiverObj]
 		if !ok {
+			continue
+		}
+		// Select the per-page template set if available, otherwise use the
+		// merged single set.
+		rt := rts.single
+		if rts.byKey != nil && p.mapKey != "" {
+			if perPage, ok := rts.byKey[p.mapKey]; ok {
+				rt = perPage
+			}
+		}
+		if rt == nil {
 			continue
 		}
 		// For Execute calls, use the receiver's root template name.
@@ -655,9 +754,12 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 
 	// Warn about unused templates.
 	if warn != nil {
-		for obj, rt := range resolved {
+		for obj, rts := range resolved {
+			if rts.single == nil {
+				continue
+			}
 			refs := referenced[obj]
-			names := rt.templates.TemplateNames()
+			names := rts.single.templates.TemplateNames()
 			sort.Strings(names)
 			for _, name := range names {
 				if name == "" {
@@ -665,7 +767,7 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 				}
 				// Skip templates with no content (e.g. the root template
 				// created by template.New("name") that serves as a container).
-				if tree, ok := rt.templates.FindTree(name); !ok || tree == nil || tree.Root == nil || len(tree.Root.Nodes) == 0 {
+				if tree, ok := rts.single.templates.FindTree(name); !ok || tree == nil || tree.Root == nil || len(tree.Root.Nodes) == 0 {
 					continue
 				}
 				if refs != nil {
@@ -706,6 +808,7 @@ func deduplicatePending(pending []pendingCall) []pendingCall {
 		dataType     string // types.Type.String() for comparison
 		nameParam    int
 		dataParam    int
+		mapKey       string
 	}
 	seen := make(map[key]bool)
 	var result []pendingCall
@@ -720,6 +823,7 @@ func deduplicatePending(pending []pendingCall) []pendingCall {
 			dataType:     dt,
 			nameParam:    p.nameParamIdx,
 			dataParam:    p.dataParamIdx,
+			mapKey:       p.mapKey,
 		}
 		if seen[k] {
 			continue
@@ -875,6 +979,15 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 					}
 				}
 
+				// Resolve map key from call site argument.
+				if p.mapKeyParamIdx >= 0 && p.mapKeyParamIdx < len(cs.Args) {
+					arg := cs.Args[p.mapKeyParamIdx]
+					if key, ok := asteval.ResolveStringExpr(pkg.TypesInfo, pkg.Syntax, arg); ok {
+						newCall.mapKey = key
+						newCall.mapKeyParamIdx = -1
+					}
+				}
+
 				if resolvedName {
 					allResolved := resolvedData && newCall.receiverParamIdx < 0
 					if allResolved {
@@ -917,6 +1030,15 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 						newCall.dataType = concreteType
 						newCall.dataParamIdx = -1
 						resolvedData = true
+					}
+				}
+
+				// Resolve map key from indirect call site argument.
+				if p.mapKeyParamIdx >= 0 && p.mapKeyParamIdx < len(cs.Args) {
+					arg := cs.Args[p.mapKeyParamIdx]
+					if key, ok := asteval.ResolveStringExpr(csInfo, nil, arg); ok {
+						newCall.mapKey = key
+						newCall.mapKeyParamIdx = -1
 					}
 				}
 
@@ -1080,6 +1202,41 @@ func findIndirectCallSites(calledObj types.Object, paramIdx int, allPkgs []*pack
 
 // paramAtIndex returns the types.Object for the parameter at the given
 // index in a function declaration's parameter list.
+// detectMapKeyParam checks if the variable obj is defined from a map index
+// expression (e.g. t, ok := templates[name]) where the index key is a
+// function/closure parameter. If so, it returns the parameter index of that
+// key. Returns -1 if the pattern is not found.
+func detectMapKeyParam(info *types.Info, files []*ast.File, obj types.Object) int {
+	v, ok := obj.(*types.Var)
+	if !ok {
+		return -1
+	}
+	// Find the defining expression for this variable.
+	defExpr, ok := asteval.FindDefiningValue(info, v, files)
+	if !ok {
+		return -1
+	}
+	// Check if the defining expression is a map index (e.g. templates[name]).
+	idx, ok := defExpr.(*ast.IndexExpr)
+	if !ok {
+		return -1
+	}
+	// Verify the map operand is actually a map type.
+	mapType := info.TypeOf(idx.X)
+	if mapType == nil {
+		return -1
+	}
+	if _, isMap := mapType.Underlying().(*types.Map); !isMap {
+		return -1
+	}
+	// Check if the index key is a function/closure parameter.
+	paramIdx, _, isParam := asteval.IsFuncParam(info, files, idx.Index)
+	if !isParam {
+		return -1
+	}
+	return paramIdx
+}
+
 func paramAtIndex(info *types.Info, fd *ast.FuncDecl, idx int) types.Object {
 	if fd.Type == nil || fd.Type.Params == nil {
 		return nil
@@ -1122,31 +1279,31 @@ func paramAtIndex(info *types.Info, fd *ast.FuncDecl, idx int) types.Object {
 //
 // In that case it follows into the function body to find map stores and
 // builds parameter bindings from the call site.
-func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDirectory, moduleRoot string, allPkgs []*packages.Package) (ast.Expr, *asteval.SliceEvalContext) {
+func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDirectory, moduleRoot string, allPkgs []*packages.Package) (ast.Expr, *asteval.SliceEvalContext, *mapStoreInfo) {
 	idx, ok := expr.(*ast.IndexExpr)
 	if !ok {
-		return expr, nil
+		return expr, nil, nil
 	}
 	// Resolve the map variable.
 	ident, ok := idx.X.(*ast.Ident)
 	if !ok {
-		return expr, nil
+		return expr, nil, nil
 	}
 	mapObj := info.Uses[ident]
 	if mapObj == nil {
 		mapObj = info.Defs[ident]
 	}
 	if mapObj == nil {
-		return expr, nil
+		return expr, nil, nil
 	}
 	// Verify it's actually a map type.
 	if _, isMap := mapObj.Type().Underlying().(*types.Map); !isMap {
-		return expr, nil
+		return expr, nil, nil
 	}
 
 	// First, look for direct stores (mapVar[key] = value) in the current scope.
 	if found := findMapStore(info, files, mapObj); found != nil {
-		return found, nil
+		return found, nil, nil
 	}
 
 	// If no direct stores, the map may come from a function call.
@@ -1154,12 +1311,12 @@ func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDi
 	if v, ok := mapObj.(*types.Var); ok {
 		defExpr, ok := asteval.FindDefiningValue(info, v, files)
 		if !ok {
-			return expr, nil
+			return expr, nil, nil
 		}
 		// If the defining value is a function call, follow into the function body.
 		call, ok := defExpr.(*ast.CallExpr)
 		if !ok {
-			return expr, nil
+			return expr, nil, nil
 		}
 		var calledObj types.Object
 		switch fn := call.Fun.(type) {
@@ -1169,7 +1326,7 @@ func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDi
 			calledObj = info.Uses[fn.Sel]
 		}
 		if calledObj == nil {
-			return expr, nil
+			return expr, nil, nil
 		}
 
 		// Find the function declaration and look for map stores inside it.
@@ -1184,7 +1341,7 @@ func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDi
 				}
 				// Found the function body. Look for map stores on any
 				// local map variable that is returned.
-				if found := findMapStoreInFunc(info, fd); found != nil {
+				if storeInfo := findMapStoreInFunc(info, fd); storeInfo != nil {
 					// Build parameter bindings from the call site so
 					// that expressions inside the function body can
 					// resolve parameters to their concrete values.
@@ -1204,13 +1361,13 @@ func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDi
 						Bindings:         bindings,
 						WorkingDirectory: sliceWD,
 					}
-					return found, ctx
+					return storeInfo.expr, ctx, storeInfo
 				}
 			}
 		}
 	}
 
-	return expr, nil
+	return expr, nil, nil
 }
 
 // buildDeepParamBindings constructs parameter bindings for a function call,
@@ -1334,15 +1491,30 @@ func findMapStore(info *types.Info, files []*ast.File, mapObj types.Object) ast.
 	return nil
 }
 
+// mapStoreInfo describes a map store found inside a function body.
+type mapStoreInfo struct {
+	// expr is the value expression stored into the map, traced back to its
+	// defining expression (e.g. template.ParseFiles(files...)).
+	expr ast.Expr
+	// keyExpr is the map index key expression (e.g. name in templates[name] = t).
+	keyExpr ast.Expr
+	// rangeVar is the for-range iteration variable, if the store is inside
+	// a for-range loop (e.g. page in "for _, page := range pageFiles").
+	// nil if not inside a range loop.
+	rangeVar *types.Var
+	// rangeExpr is the range expression (e.g. pageFiles), if rangeVar is set.
+	rangeExpr ast.Expr
+}
+
 // findMapStoreInFunc looks inside a function body for the first map store
 // (localMap[key] = value) where localMap is of a map type, and returns the
-// stored value expression. If the stored value is a variable, it traces
-// back to the defining expression (e.g. templates[name] = t traces t back
-// to template.ParseFiles(...)).
-func findMapStoreInFunc(info *types.Info, fd *ast.FuncDecl) ast.Expr {
-	var found ast.Expr
+// stored value expression along with loop context if the store is inside
+// a for-range loop. If the stored value is a variable, it traces back to
+// the defining expression.
+func findMapStoreInFunc(info *types.Info, fd *ast.FuncDecl) *mapStoreInfo {
+	var foundAssign *ast.AssignStmt
 	ast.Inspect(fd.Body, func(node ast.Node) bool {
-		if found != nil {
+		if foundAssign != nil {
 			return false
 		}
 		assign, ok := node.(*ast.AssignStmt)
@@ -1370,23 +1542,67 @@ func findMapStoreInFunc(info *types.Info, fd *ast.FuncDecl) ast.Expr {
 		if _, isMap := lhsObj.Type().Underlying().(*types.Map); !isMap {
 			return true
 		}
-		found = assign.Rhs[0]
+		foundAssign = assign
 		return false
 	})
+	if foundAssign == nil {
+		return nil
+	}
+
+	result := &mapStoreInfo{expr: foundAssign.Rhs[0]}
+
+	// Capture the map key expression from the LHS (e.g. name in templates[name] = t).
+	if lhsIdx, ok := foundAssign.Lhs[0].(*ast.IndexExpr); ok {
+		result.keyExpr = lhsIdx.Index
+	}
+
 	// If the stored value is a variable, trace it back to its defining
 	// expression. This handles patterns like:
 	//   t, err := template.ParseFiles(files...)
 	//   templates[name] = t
-	if ident, ok := found.(*ast.Ident); ok && info != nil {
+	if ident, ok := result.expr.(*ast.Ident); ok {
 		if obj := info.Uses[ident]; obj != nil {
 			if v, ok := obj.(*types.Var); ok {
 				if defExpr, ok := asteval.FindDefiningValueInBlock(info, v, fd.Body); ok {
-					found = defExpr
+					result.expr = defExpr
 				}
 			}
 		}
 	}
-	return found
+
+	// Check if the store is inside a for-range loop.
+	result.rangeVar, result.rangeExpr = findEnclosingRange(info, fd.Body, foundAssign.Pos())
+
+	return result
+}
+
+// findEnclosingRange checks if pos is inside a for-range loop within block.
+// If so, returns the range iteration variable and the range expression.
+func findEnclosingRange(info *types.Info, block ast.Node, pos token.Pos) (*types.Var, ast.Expr) {
+	var rangeVar *types.Var
+	var rangeExpr ast.Expr
+	ast.Inspect(block, func(node ast.Node) bool {
+		rs, ok := node.(*ast.RangeStmt)
+		if !ok {
+			return true
+		}
+		if rs.Body == nil || pos < rs.Body.Pos() || pos > rs.Body.End() {
+			return true
+		}
+		// pos is inside this range body. Capture the value variable and expression.
+		if rs.Value != nil {
+			if ident, ok := rs.Value.(*ast.Ident); ok {
+				if obj := info.Defs[ident]; obj != nil {
+					if v, ok := obj.(*types.Var); ok {
+						rangeVar = v
+						rangeExpr = rs.X
+					}
+				}
+			}
+		}
+		return true // keep looking for more tightly nested ranges
+	})
+	return rangeVar, rangeExpr
 }
 
 func packageDirectory(pkg *packages.Package) string {
