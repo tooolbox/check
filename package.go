@@ -115,14 +115,16 @@ type DeferredCall struct {
 // If warn is non-nil, it is called for non-fatal issues such as unused templates
 // or unguarded pointer access.
 func Package(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
-	_, err := PackageWithDeferred(pkg, inspectCall, inspectTemplate, warn, nil)
+	_, err := PackageWithDeferred(pkg, inspectCall, inspectTemplate, warn, nil, nil)
 	return err
 }
 
 // PackageWithDeferred is like Package but also accepts deferred calls from
 // dependency packages and returns any new deferred calls discovered in this
-// package. This enables cross-package call-graph tracing.
-func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc, imported []DeferredCall) ([]DeferredCall, error) {
+// package. This enables cross-package call-graph tracing. allPkgs, if
+// provided, enables cross-package parameter resolution for template
+// construction tracing.
+func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc, imported []DeferredCall, allPkgs []*packages.Package) ([]DeferredCall, error) {
 	pending, receivers := findExecuteCalls(pkg, warn)
 
 	// Resolve calls from imported packages' deferred wrappers.
@@ -151,7 +153,7 @@ func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeI
 		resolvedPending = append(resolvedPending, p)
 	}
 
-	resolved, resolveErrs := resolveTemplates(pkg, receivers)
+	resolved, resolveErrs := resolveTemplates(pkg, receivers, allPkgs)
 
 	// Attach resolved templates to deferred calls.
 	for i := range deferred {
@@ -393,10 +395,14 @@ func findExecuteCalls(pkg *packages.Package, warn PackageWarningFunc) ([]pending
 
 // resolveTemplates resolves each unique receiver object to its template
 // construction chain, including additional ParseFS/Parse modifications.
-func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}) (map[types.Object]*resolvedTemplate, []error) {
+func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}, allPkgs []*packages.Package) (map[types.Object]*resolvedTemplate, []error) {
 	resolved := make(map[types.Object]*resolvedTemplate)
 
 	workingDirectory := packageDirectory(pkg)
+	moduleRoot := ""
+	if pkg.Module != nil {
+		moduleRoot = pkg.Module.Dir
+	}
 	embeddedPaths, err := asteval.RelativeFilePaths(workingDirectory, pkg.EmbedFiles...)
 	if err != nil {
 		return nil, []error{fmt.Errorf("failed to calculate relative path for embedded files: %w", err)}
@@ -408,9 +414,23 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 		if _, needed := receivers[obj]; !needed {
 			return
 		}
+
+		// If the defining expression is a map index (e.g. t, ok := templates[name]),
+		// trace through the map to find where values are stored into it.
+		var sliceCtx *asteval.SliceEvalContext
+		expr, sliceCtx = traceMapIndex(pkg.TypesInfo, pkg.Syntax, expr, workingDirectory, moduleRoot, allPkgs)
+
+		// Only attempt resolution if the expression is a call. Non-call
+		// expressions (e.g. unresolved map lookups, function returns that
+		// couldn't be traced) are silently skipped — the receiver simply
+		// won't be type-checked.
+		if _, isCall := expr.(*ast.CallExpr); !isCall {
+			return
+		}
+
 		funcTypeMap := asteval.DefaultFunctions(pkg.Types)
 		meta := &asteval.TemplateMetadata{}
-		ts, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, funcTypeMap, make(map[string]any), meta)
+		ts, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, funcTypeMap, make(map[string]any), meta, sliceCtx)
 		if err != nil {
 			resolveErrs = append(resolveErrs, err)
 			return
@@ -500,7 +520,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 				return true
 			}
 			meta := &asteval.TemplateMetadata{}
-			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.functions, make(map[string]any), meta)
+			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.functions, make(map[string]any), meta, nil)
 			if err != nil {
 				return true
 			}
@@ -848,6 +868,293 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 	}
 
 	return pending
+}
+
+// traceMapIndex checks whether expr is a map index expression (e.g.
+// templates[name]) and, if so, looks for store operations into that map
+// (mapVar[key] = value) to find the first value expression that was stored.
+// It returns the traced expression and an optional SliceEvalContext with
+// parameter bindings when the trace followed into a helper function.
+//
+// This allows the tool to trace through patterns like:
+//
+//	templates := make(map[string]*template.Template)
+//	for ... { templates[name] = template.ParseFiles(...) }
+//	t, ok := templates[name]
+//	t.ExecuteTemplate(w, "base.html", data)
+//
+// It also handles the case where the map is returned from a function call:
+//
+//	templates := loadTemplates(root)   // returns map[string]*template.Template
+//	t, ok := templates[name]
+//
+// In that case it follows into the function body to find map stores and
+// builds parameter bindings from the call site.
+func traceMapIndex(info *types.Info, files []*ast.File, expr ast.Expr, workingDirectory, moduleRoot string, allPkgs []*packages.Package) (ast.Expr, *asteval.SliceEvalContext) {
+	idx, ok := expr.(*ast.IndexExpr)
+	if !ok {
+		return expr, nil
+	}
+	// Resolve the map variable.
+	ident, ok := idx.X.(*ast.Ident)
+	if !ok {
+		return expr, nil
+	}
+	mapObj := info.Uses[ident]
+	if mapObj == nil {
+		mapObj = info.Defs[ident]
+	}
+	if mapObj == nil {
+		return expr, nil
+	}
+	// Verify it's actually a map type.
+	if _, isMap := mapObj.Type().Underlying().(*types.Map); !isMap {
+		return expr, nil
+	}
+
+	// First, look for direct stores (mapVar[key] = value) in the current scope.
+	if found := findMapStore(info, files, mapObj); found != nil {
+		return found, nil
+	}
+
+	// If no direct stores, the map may come from a function call.
+	// Trace the map variable back to its defining value.
+	if v, ok := mapObj.(*types.Var); ok {
+		defExpr, ok := asteval.FindDefiningValue(info, v, files)
+		if !ok {
+			return expr, nil
+		}
+		// If the defining value is a function call, follow into the function body.
+		call, ok := defExpr.(*ast.CallExpr)
+		if !ok {
+			return expr, nil
+		}
+		var calledObj types.Object
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			calledObj = info.Uses[fn]
+		case *ast.SelectorExpr:
+			calledObj = info.Uses[fn.Sel]
+		}
+		if calledObj == nil {
+			return expr, nil
+		}
+
+		// Find the function declaration and look for map stores inside it.
+		for _, file := range files {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Name == nil || fd.Body == nil {
+					continue
+				}
+				if info.Defs[fd.Name] != calledObj {
+					continue
+				}
+				// Found the function body. Look for map stores on any
+				// local map variable that is returned.
+				if found := findMapStoreInFunc(info, fd); found != nil {
+					// Build parameter bindings from the call site so
+					// that expressions inside the function body can
+					// resolve parameters to their concrete values.
+					bindings := buildDeepParamBindings(info, files, call, fd, allPkgs)
+					// Use the module root as the working directory for
+					// resolving relative paths (template paths are
+					// typically relative to where the binary runs, not
+					// the package directory).
+					sliceWD := workingDirectory
+					if moduleRoot != "" {
+						sliceWD = moduleRoot
+					}
+					ctx := &asteval.SliceEvalContext{
+						Info:             info,
+						Files:            files,
+						Block:            fd.Body,
+						Bindings:         bindings,
+						WorkingDirectory: sliceWD,
+					}
+					return found, ctx
+				}
+			}
+		}
+	}
+
+	return expr, nil
+}
+
+// buildDeepParamBindings constructs parameter bindings for a function call,
+// resolving arguments that are themselves function parameters by tracing
+// up the call graph. This handles chains like:
+//
+//	func New(templateRoot string) { loadTemplates(templateRoot) }
+//	app.New(db, "templates")  // called from another package or same package
+//
+// It first tries direct string resolution, then checks if the arg is a
+// parameter of an enclosing function and resolves it via call sites.
+func buildDeepParamBindings(info *types.Info, files []*ast.File, call *ast.CallExpr, fd *ast.FuncDecl, allPkgs []*packages.Package) asteval.ParamBindings {
+	if fd.Type == nil || fd.Type.Params == nil {
+		return nil
+	}
+	bindings := make(asteval.ParamBindings)
+	// Build call site indices for the current package and all packages
+	// (for cross-package parameter resolution).
+	var contexts []paramResolveContext
+	contexts = append(contexts, paramResolveContext{info, files, asteval.BuildCallSiteIndex(info, files)})
+	for _, p := range allPkgs {
+		if p.TypesInfo != info && p.TypesInfo != nil {
+			contexts = append(contexts, paramResolveContext{p.TypesInfo, p.Syntax, asteval.BuildCallSiteIndex(p.TypesInfo, p.Syntax)})
+		}
+	}
+
+	argIdx := 0
+	for _, field := range fd.Type.Params.List {
+		for _, name := range field.Names {
+			if argIdx >= len(call.Args) {
+				return bindings
+			}
+			if v, ok := info.Defs[name].(*types.Var); ok {
+				if s, ok := resolveStringDeep(info, files, call.Args[argIdx], contexts, 0); ok {
+					bindings[v] = s
+				}
+			}
+			argIdx++
+		}
+		if len(field.Names) == 0 {
+			argIdx++
+		}
+	}
+	return bindings
+}
+
+// resolveStringDeep resolves an expression to a string, chasing function
+// parameters up the call graph across all packages when needed.
+func resolveStringDeep(info *types.Info, files []*ast.File, expr ast.Expr, contexts []paramResolveContext, depth int) (string, bool) {
+	if depth > 5 {
+		return "", false
+	}
+
+	// Try direct resolution first.
+	if s, ok := asteval.ResolveStringExpr(info, files, expr); ok {
+		return s, true
+	}
+
+	// If it's an identifier referring to a function parameter, chase call sites
+	// across all packages.
+	paramIdx, funcObj, ok := asteval.IsFuncParam(info, files, expr)
+	if !ok {
+		return "", false
+	}
+	for _, ctx := range contexts {
+		for _, cs := range ctx.index[funcObj] {
+			if paramIdx < len(cs.Args) {
+				if s, ok := resolveStringDeep(ctx.info, ctx.files, cs.Args[paramIdx], contexts, depth+1); ok {
+					return s, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+type paramResolveContext struct {
+	info  *types.Info
+	files []*ast.File
+	index map[types.Object][]*ast.CallExpr
+}
+
+// findMapStore scans files for the first assignment of the form
+// mapVar[key] = value where mapVar resolves to mapObj.
+func findMapStore(info *types.Info, files []*ast.File, mapObj types.Object) ast.Expr {
+	for _, file := range files {
+		var found ast.Expr
+		ast.Inspect(file, func(node ast.Node) bool {
+			if found != nil {
+				return false
+			}
+			assign, ok := node.(*ast.AssignStmt)
+			if !ok || assign.Tok != token.ASSIGN {
+				return true
+			}
+			if len(assign.Lhs) < 1 || len(assign.Rhs) < 1 {
+				return true
+			}
+			lhsIdx, ok := assign.Lhs[0].(*ast.IndexExpr)
+			if !ok {
+				return true
+			}
+			lhsIdent, ok := lhsIdx.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			lhsObj := info.Uses[lhsIdent]
+			if lhsObj == nil {
+				lhsObj = info.Defs[lhsIdent]
+			}
+			if lhsObj == mapObj {
+				found = assign.Rhs[0]
+				return false
+			}
+			return true
+		})
+		if found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// findMapStoreInFunc looks inside a function body for the first map store
+// (localMap[key] = value) where localMap is of a map type, and returns the
+// stored value expression. If the stored value is a variable, it traces
+// back to the defining expression (e.g. templates[name] = t traces t back
+// to template.ParseFiles(...)).
+func findMapStoreInFunc(info *types.Info, fd *ast.FuncDecl) ast.Expr {
+	var found ast.Expr
+	ast.Inspect(fd.Body, func(node ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.ASSIGN {
+			return true
+		}
+		if len(assign.Lhs) < 1 || len(assign.Rhs) < 1 {
+			return true
+		}
+		lhsIdx, ok := assign.Lhs[0].(*ast.IndexExpr)
+		if !ok {
+			return true
+		}
+		lhsIdent, ok := lhsIdx.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		lhsObj := info.Uses[lhsIdent]
+		if lhsObj == nil {
+			lhsObj = info.Defs[lhsIdent]
+		}
+		if lhsObj == nil {
+			return true
+		}
+		if _, isMap := lhsObj.Type().Underlying().(*types.Map); !isMap {
+			return true
+		}
+		found = assign.Rhs[0]
+		return false
+	})
+	// If the stored value is a variable, trace it back to its defining
+	// expression. This handles patterns like:
+	//   t, err := template.ParseFiles(files...)
+	//   templates[name] = t
+	if ident, ok := found.(*ast.Ident); ok && info != nil {
+		if obj := info.Uses[ident]; obj != nil {
+			if v, ok := obj.(*types.Var); ok {
+				if defExpr, ok := asteval.FindDefiningValueInBlock(info, v, fd.Body); ok {
+					found = defExpr
+				}
+			}
+		}
+	}
+	return found
 }
 
 func packageDirectory(pkg *packages.Package) string {

@@ -38,7 +38,7 @@ type TemplateMetadata struct {
 	ParseCalls     []*ast.BasicLit
 }
 
-func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.Info, expression ast.Expr, workingDirectory, templatesVariable, rDelim, lDelim string, fileSet *token.FileSet, files []*ast.File, embeddedPaths []string, funcTypeMaps TemplateFunctions, fm map[string]any, meta *TemplateMetadata) (Template, string, string, error) {
+func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.Info, expression ast.Expr, workingDirectory, templatesVariable, rDelim, lDelim string, fileSet *token.FileSet, files []*ast.File, embeddedPaths []string, funcTypeMaps TemplateFunctions, fm map[string]any, meta *TemplateMetadata, sliceCtx *SliceEvalContext) (Template, string, string, error) {
 	call, ok := expression.(*ast.CallExpr)
 	if !ok {
 		return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, expression.Pos(), fmt.Errorf("expected call expression"))
@@ -69,7 +69,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 				t, err := parseFiles(ts, pkgPath, fm, lDelim, rDelim, filePaths...)
 				return t, lDelim, rDelim, err
 			case "ParseFiles":
-				filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+				filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call, sliceCtx)
 				if err != nil {
 					return nil, lDelim, rDelim, err
 				}
@@ -127,7 +127,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			if len(call.Args) != 1 {
 				return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("expected exactly one argument %s got %d", astgen.Format(sel.X), len(call.Args)))
 			}
-			return EvaluateTemplateSelector(ts, pkg, typesInfo, call.Args[0], workingDirectory, templatesVariable, rDelim, lDelim, fileSet, files, embeddedPaths, funcTypeMaps, fm, meta)
+			return EvaluateTemplateSelector(ts, pkg, typesInfo, call.Args[0], workingDirectory, templatesVariable, rDelim, lDelim, fileSet, files, embeddedPaths, funcTypeMaps, fm, meta, sliceCtx)
 		case "New":
 			if len(call.Args) != 1 {
 				return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("expected exactly one string literal argument"))
@@ -148,7 +148,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			t, err := parseFiles(nil, pkgPath, fm, lDelim, rDelim, filePaths...)
 			return t, lDelim, rDelim, err
 		case "ParseFiles":
-			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call, sliceCtx)
 			if err != nil {
 				return nil, lDelim, rDelim, err
 			}
@@ -165,7 +165,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			return nil, lDelim, rDelim, wrapWithFilename(workingDirectory, fileSet, call.Fun.Pos(), fmt.Errorf("unsupported function %s", sel.Sel.Name))
 		}
 	case *ast.CallExpr:
-		up, upLDelim, upRDelim, err := EvaluateTemplateSelector(ts, pkg, typesInfo, sel.X, workingDirectory, templatesVariable, rDelim, lDelim, fileSet, files, embeddedPaths, funcTypeMaps, fm, meta)
+		up, upLDelim, upRDelim, err := EvaluateTemplateSelector(ts, pkg, typesInfo, sel.X, workingDirectory, templatesVariable, rDelim, lDelim, fileSet, files, embeddedPaths, funcTypeMaps, fm, meta, sliceCtx)
 		if err != nil {
 			return nil, lDelim, rDelim, err
 		}
@@ -214,7 +214,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			t, err := parseFiles(up, "", fm, upLDelim, upRDelim, filePaths...)
 			return t, upLDelim, upRDelim, err
 		case "ParseFiles":
-			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call)
+			filePaths, err := evaluateParseFilesArgs(workingDirectory, fileSet, call, sliceCtx)
 			if err != nil {
 				return nil, upLDelim, upRDelim, err
 			}
@@ -493,18 +493,56 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 	return joinFilePaths(workingDirectory, filtered...), nil
 }
 
-func evaluateParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr) ([]string, error) {
+func evaluateParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, sliceCtx *SliceEvalContext) ([]string, error) {
 	if len(call.Args) < 1 {
 		return nil, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("missing required arguments"))
 	}
+
+	// Fast path: all arguments are string literals.
 	filePaths, err := StringLiteralExpressionList(workingDirectory, fileSet, call.Args)
-	if err != nil {
+	if err == nil {
+		for i, fp := range filePaths {
+			if !filepath.IsAbs(fp) {
+				filePaths[i] = filepath.Join(workingDirectory, fp)
+			}
+		}
+		return filePaths, nil
+	}
+
+	// Slow path: try resolving via the string-slice evaluator.
+	if sliceCtx == nil {
 		return nil, err
 	}
-	for i, fp := range filePaths {
-		if !filepath.IsAbs(fp) {
-			filePaths[i] = filepath.Join(workingDirectory, fp)
+
+	// Handle spread call: ParseFiles(files...)
+	if call.Ellipsis.IsValid() && len(call.Args) == 1 {
+		resolved, ok := ResolveStringSliceExpr(sliceCtx, call.Args[0])
+		if !ok {
+			return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[0].Pos(), fmt.Errorf("could not resolve spread argument"))
 		}
+		// Use the slice context's working directory (typically the module
+		// root) for relative paths, since these come from runtime-relative
+		// filepath.Join calls, not package-relative embed paths.
+		wd := sliceCtx.WorkingDirectory
+		for i, fp := range resolved {
+			if !filepath.IsAbs(fp) {
+				resolved[i] = filepath.Join(wd, fp)
+			}
+		}
+		return resolved, nil
+	}
+
+	// Handle individual non-literal args.
+	filePaths = make([]string, 0, len(call.Args))
+	for _, arg := range call.Args {
+		s, ok := sliceCtx.resolveString(arg)
+		if !ok {
+			return nil, wrapWithFilename(workingDirectory, fileSet, arg.Pos(), fmt.Errorf("could not resolve argument"))
+		}
+		if !filepath.IsAbs(s) {
+			s = filepath.Join(workingDirectory, s)
+		}
+		filePaths = append(filePaths, s)
 	}
 	return filePaths, nil
 }
