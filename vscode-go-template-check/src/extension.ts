@@ -3,6 +3,7 @@ import * as cp from 'child_process';
 import * as path from 'path';
 
 let diagnostics: vscode.DiagnosticCollection;
+let checkTimer: ReturnType<typeof setTimeout> | undefined;
 
 // LINE_RE matches a single check-templates stderr line:
 //   path/to/file.gohtml:line:col: message (E001)
@@ -11,7 +12,10 @@ let diagnostics: vscode.DiagnosticCollection;
 const LINE_RE = /^(.+?):(\d+):(\d+): (.+)$/;
 
 // Template file extensions we trigger on (besides .go).
-const TEMPLATE_EXT_RE = /\.(gohtml|tmpl|gotmpl)$/;
+const TEMPLATE_EXT_RE = /\.(gohtml|tmpl|gotmpl|html)$/;
+
+// Debounce delay (ms) for filesystem watcher events to batch rapid writes.
+const DEBOUNCE_MS = 1500;
 
 export function activate(context: vscode.ExtensionContext): void {
 	diagnostics = vscode.languages.createDiagnosticCollection('templatecheck');
@@ -19,19 +23,43 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	checkBinaryInstalled();
 
+	// Trigger on manual save.
 	context.subscriptions.push(
 		vscode.workspace.onDidSaveTextDocument(onSave)
 	);
+
+	// Trigger on filesystem changes (covers AI agents writing files directly).
+	const goWatcher = vscode.workspace.createFileSystemWatcher('**/*.go');
+	const tmplWatcher = vscode.workspace.createFileSystemWatcher('**/*.{gohtml,tmpl,gotmpl,html}');
+	for (const watcher of [goWatcher, tmplWatcher]) {
+		context.subscriptions.push(watcher);
+		watcher.onDidChange(() => debouncedCheck());
+		watcher.onDidCreate(() => debouncedCheck());
+		watcher.onDidDelete(() => debouncedCheck());
+	}
 }
 
 export function deactivate(): void {
 	diagnostics?.dispose();
+	if (checkTimer) {
+		clearTimeout(checkTimer);
+	}
 }
 
 function onSave(doc: vscode.TextDocument): void {
 	if (doc.languageId === 'go' || TEMPLATE_EXT_RE.test(doc.fileName)) {
 		runCheck();
 	}
+}
+
+function debouncedCheck(): void {
+	if (checkTimer) {
+		clearTimeout(checkTimer);
+	}
+	checkTimer = setTimeout(() => {
+		checkTimer = undefined;
+		runCheck();
+	}, DEBOUNCE_MS);
 }
 
 function checkBinaryInstalled(): void {
