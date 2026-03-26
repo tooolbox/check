@@ -741,7 +741,10 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 			}
 		}
 		// Merge sub-template call types collected during this Execute run.
-		if warn != nil {
+		// Skip for per-page scoped calls — each page legitimately passes a
+		// different type to shared sub-templates like {{template "content" .}},
+		// and each is already fully type-checked by Execute above.
+		if warn != nil && p.mapKey == "" {
 			byName := subTemplateTypes[p.receiverObj]
 			if byName == nil {
 				byName = make(map[string][]types.Type)
