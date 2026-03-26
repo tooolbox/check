@@ -132,7 +132,7 @@ func PackageWithDeferred(pkg *packages.Package, inspectCall ExecuteTemplateNodeI
 		pending = resolveImportedCalls(pkg, pending, receivers, imported)
 	}
 
-	pending = resolveCallGraph(pkg, pending, receivers, warn)
+	pending = resolveCallGraph(pkg, pending, receivers, warn, allPkgs)
 
 	// Collect deferred calls for exported functions before resolving templates.
 	var deferred []DeferredCall
@@ -695,7 +695,42 @@ func isEmptyInterface(tp types.Type) bool {
 // or data types by tracing through function call sites within the package.
 // It returns the expanded list of pending calls and emits warnings for any
 // calls that could not be resolved.
-func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers map[types.Object]struct{}, warn PackageWarningFunc) []pendingCall {
+// deduplicatePending removes pending calls that are identical on the
+// dimensions that affect type-checking: template name, receiver object,
+// and data type. This prevents duplicate errors when the same template
+// is reached through multiple indirect call sites with the same type.
+func deduplicatePending(pending []pendingCall) []pendingCall {
+	type key struct {
+		templateName string
+		receiverObj  types.Object
+		dataType     string // types.Type.String() for comparison
+		nameParam    int
+		dataParam    int
+	}
+	seen := make(map[key]bool)
+	var result []pendingCall
+	for _, p := range pending {
+		dt := ""
+		if p.dataType != nil {
+			dt = p.dataType.String()
+		}
+		k := key{
+			templateName: p.templateName,
+			receiverObj:  p.receiverObj,
+			dataType:     dt,
+			nameParam:    p.nameParamIdx,
+			dataParam:    p.dataParamIdx,
+		}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		result = append(result, p)
+	}
+	return result
+}
+
+func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers map[types.Object]struct{}, warn PackageWarningFunc, allPkgs []*packages.Package) []pendingCall {
 	// Check if any calls need resolution.
 	needsResolution := false
 	for _, p := range pending {
@@ -709,6 +744,14 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 	}
 
 	callIndex := asteval.BuildCallSiteIndex(pkg.TypesInfo, pkg.Syntax)
+
+	// Build an index of indirect call sites for closure variables passed as
+	// arguments to functions in other packages. These are paired with the
+	// type info from the package where the call occurs.
+	var indirectIndex map[types.Object][]indirectCallSite
+	if len(allPkgs) > 0 {
+		indirectIndex = buildIndirectClosureCallSites(pkg, allPkgs)
+	}
 
 	// Iterate to a fixed point to handle multi-level call chains.
 	const maxIterations = 5
@@ -738,8 +781,9 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 				continue
 			}
 
-			callSites := callIndex[p.enclosingFunc]
-			if len(callSites) == 0 {
+			directSites := callIndex[p.enclosingFunc]
+			indirectSites := indirectIndex[p.enclosingFunc]
+			if len(directSites) == 0 && len(indirectSites) == 0 {
 				if p.nameParamIdx >= 0 {
 					// No intra-package call sites. If the function is
 					// exported, keep the call for cross-package deferred
@@ -762,7 +806,8 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 				continue
 			}
 
-			for _, cs := range callSites {
+			// Process direct (same-package) call sites.
+			for _, cs := range directSites {
 				newCall := p
 				resolvedName := p.nameParamIdx < 0
 				resolvedData := p.dataParamIdx < 0
@@ -843,9 +888,50 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 					expanded = append(expanded, newCall)
 				}
 			}
+
+			// Process indirect (cross-package) call sites. These come
+			// from tracing closure variables passed as function arguments
+			// into the callee's body.
+			for _, ics := range indirectSites {
+				cs := ics.call
+				csInfo := ics.info
+				newCall := p
+				resolvedName := p.nameParamIdx < 0
+				resolvedData := p.dataParamIdx < 0
+
+				if p.nameParamIdx >= 0 && p.nameParamIdx < len(cs.Args) {
+					arg := cs.Args[p.nameParamIdx]
+					name, ok := asteval.ResolveStringExpr(csInfo, nil, arg)
+					if ok {
+						newCall.templateName = name
+						newCall.nameParamIdx = -1
+						newCall.enclosingFunc = nil
+						resolvedName = true
+					}
+				}
+
+				if p.dataParamIdx >= 0 && p.dataParamIdx < len(cs.Args) {
+					arg := cs.Args[p.dataParamIdx]
+					concreteType := csInfo.TypeOf(arg)
+					if concreteType != nil && !isEmptyInterface(concreteType) {
+						newCall.dataType = concreteType
+						newCall.dataParamIdx = -1
+						resolvedData = true
+					}
+				}
+
+				if resolvedName {
+					allResolved := resolvedData && newCall.receiverParamIdx < 0
+					if allResolved {
+						newCall.enclosingFunc = nil
+					}
+					expanded = append(expanded, newCall)
+					changed = true
+				}
+			}
 		}
 
-		pending = expanded
+		pending = deduplicatePending(expanded)
 
 		if !changed || iter == maxIterations-1 {
 			// Emit warnings for remaining unresolved calls, keeping
@@ -868,6 +954,152 @@ func resolveCallGraph(pkg *packages.Package, pending []pendingCall, receivers ma
 	}
 
 	return pending
+}
+
+// indirectCallSite pairs a call expression with the type info from the
+// package where it occurs. This is needed because indirect call sites
+// (calls to closure parameters inside other packages' function bodies)
+// require type resolution from their own package context.
+type indirectCallSite struct {
+	call *ast.CallExpr
+	info *types.Info
+}
+
+// buildIndirectClosureCallSites scans the current package for places where
+// func-typed variables are passed as arguments to functions, then traces
+// into those function bodies (across all loaded packages) to find calls to
+// the corresponding parameter.
+//
+// This handles patterns like:
+//
+//	render := func(w http.ResponseWriter, name string, data any) {
+//	    t.ExecuteTemplate(w, "base.html", data)
+//	}
+//	handlers.HandleVehiclesList(db, render)
+//
+// Inside HandleVehiclesList, the parameter render is called with concrete types:
+//
+//	func HandleVehiclesList(db *sql.DB, render func(http.ResponseWriter, string, any)) http.HandlerFunc {
+//	    return func(w http.ResponseWriter, r *http.Request) {
+//	        render(w, "vehicles/list.html", VehiclesListPage{Vehicles: vehicles})
+//	    }
+//	}
+//
+// The call render(w, "vehicles/list.html", VehiclesListPage{...}) is returned
+// as an indirect call site of the original render variable, paired with
+// the handler package's type info so types can be resolved correctly.
+func buildIndirectClosureCallSites(pkg *packages.Package, allPkgs []*packages.Package) map[types.Object][]indirectCallSite {
+	index := make(map[types.Object][]indirectCallSite)
+
+	for _, file := range pkg.Syntax {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var calledObj types.Object
+			switch fn := call.Fun.(type) {
+			case *ast.Ident:
+				calledObj = pkg.TypesInfo.Uses[fn]
+			case *ast.SelectorExpr:
+				calledObj = pkg.TypesInfo.Uses[fn.Sel]
+			}
+			if calledObj == nil {
+				return true
+			}
+
+			for argIdx, arg := range call.Args {
+				ident, ok := arg.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				argObj := pkg.TypesInfo.Uses[ident]
+				if argObj == nil {
+					continue
+				}
+				if _, isSig := argObj.Type().Underlying().(*types.Signature); !isSig {
+					continue
+				}
+				sites := findIndirectCallSites(calledObj, argIdx, allPkgs)
+				if len(sites) > 0 {
+					index[argObj] = append(index[argObj], sites...)
+				}
+			}
+			return true
+		})
+	}
+	return index
+}
+
+// findIndirectCallSites looks for calls to the parameter at position paramIdx
+// inside the body of the function identified by calledObj. It searches
+// across all loaded packages and returns call sites paired with their type info.
+func findIndirectCallSites(calledObj types.Object, paramIdx int, allPkgs []*packages.Package) []indirectCallSite {
+	var results []indirectCallSite
+
+	for _, p := range allPkgs {
+		if p.TypesInfo == nil {
+			continue
+		}
+		for _, file := range p.Syntax {
+			for _, decl := range file.Decls {
+				fd, ok := decl.(*ast.FuncDecl)
+				if !ok || fd.Name == nil || fd.Body == nil {
+					continue
+				}
+				if p.TypesInfo.Defs[fd.Name] != calledObj {
+					continue
+				}
+				paramObj := paramAtIndex(p.TypesInfo, fd, paramIdx)
+				if paramObj == nil {
+					return nil
+				}
+				// Find all calls to this parameter in the function body
+				// (including nested closures).
+				info := p.TypesInfo
+				ast.Inspect(fd.Body, func(node ast.Node) bool {
+					call, ok := node.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					ident, ok := call.Fun.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					if info.Uses[ident] == paramObj {
+						results = append(results, indirectCallSite{call: call, info: info})
+					}
+					return true
+				})
+				return results
+			}
+		}
+	}
+	return results
+}
+
+// paramAtIndex returns the types.Object for the parameter at the given
+// index in a function declaration's parameter list.
+func paramAtIndex(info *types.Info, fd *ast.FuncDecl, idx int) types.Object {
+	if fd.Type == nil || fd.Type.Params == nil {
+		return nil
+	}
+	cur := 0
+	for _, field := range fd.Type.Params.List {
+		for _, name := range field.Names {
+			if cur == idx {
+				return info.Defs[name]
+			}
+			cur++
+		}
+		if len(field.Names) == 0 {
+			if cur == idx {
+				return nil // unnamed param, can't track
+			}
+			cur++
+		}
+	}
+	return nil
 }
 
 // traceMapIndex checks whether expr is a map index expression (e.g.
