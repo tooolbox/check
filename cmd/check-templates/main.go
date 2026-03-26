@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 
 	"golang.org/x/tools/go/packages"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/tooolbox/check"
 )
 
@@ -24,6 +27,10 @@ var version = "(dev)"
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		fmt.Println("check-templates " + version)
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "--mcp" {
+		serveMCP()
 		return
 	}
 	wd, err := os.Getwd()
@@ -157,4 +164,103 @@ func parseLocation(loc string) token.Position {
 	}
 	pos.Filename = loc
 	return pos
+}
+
+// serveMCP starts the MCP (Model Context Protocol) server over stdio,
+// exposing check-templates as a tool for AI agents.
+func serveMCP() {
+	s := server.NewMCPServer("check-templates", version)
+
+	s.AddTool(
+		mcp.NewTool("check_templates",
+			mcp.WithDescription(
+				"Type-check Go html/template and text/template ExecuteTemplate calls. "+
+					"Analyses the Go packages at the given directory, resolves template "+
+					"construction chains (ParseFS, ParseFiles, ParseGlob, Parse), and "+
+					"reports field/method access errors and warnings. "+
+					"Returns diagnostics as one-per-line in file:line:col: message (CODE) format.",
+			),
+			mcp.WithString("directory",
+				mcp.Required(),
+				mcp.Description("Absolute path to the Go module or package directory to check."),
+			),
+			mcp.WithString("pattern",
+				mcp.Description("Go package pattern to check (default \"./...\")."),
+			),
+			mcp.WithBoolean("warnings",
+				mcp.Description("Enable warnings (unused templates, nil dereference, etc.) in addition to errors. Default true."),
+			),
+		),
+		handleMCPCheck,
+	)
+
+	if err := server.ServeStdio(s); err != nil {
+		log.Fatalf("MCP server error: %v", err)
+	}
+}
+
+func handleMCPCheck(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dir := request.GetString("directory", "")
+	if dir == "" {
+		return mcp.NewToolResultError("directory is required"), nil
+	}
+
+	pattern := request.GetString("pattern", "./...")
+	enableWarnings := request.GetBool("warnings", true)
+
+	diagnostics, err := mcpRunCheck(dir, pattern, enableWarnings)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to run check: %v", err)), nil
+	}
+
+	if len(diagnostics) == 0 {
+		return mcp.NewToolResultText("No errors or warnings found."), nil
+	}
+
+	return mcp.NewToolResultText(strings.Join(diagnostics, "\n")), nil
+}
+
+func mcpRunCheck(dir, pattern string, enableWarnings bool) ([]string, error) {
+	fset := token.NewFileSet()
+	pkgs, err := packages.Load(&packages.Config{
+		Fset: fset,
+		Mode: packages.NeedTypesInfo | packages.NeedName | packages.NeedFiles |
+			packages.NeedTypes | packages.NeedSyntax | packages.NeedEmbedPatterns |
+			packages.NeedEmbedFiles | packages.NeedImports | packages.NeedModule,
+		Dir: dir,
+	}, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("loading packages: %w", err)
+	}
+
+	var diagnostics []string
+	var allDeferred []check.DeferredCall
+
+	for _, pkg := range pkgs {
+		for _, e := range pkg.Errors {
+			diagnostics = append(diagnostics, e.Error())
+		}
+
+		var warnFunc check.PackageWarningFunc
+		if enableWarnings {
+			warnFunc = func(cat check.WarningCategory, pos token.Position, message string) {
+				diagnostics = append(diagnostics, fmt.Sprintf("%s: %s (%s)", pos, message, cat.Code()))
+			}
+		}
+
+		deferred, err := check.PackageWithDeferred(pkg, func(node *ast.CallExpr, t *parse.Tree, tp types.Type) {
+		}, func(node *parse.TemplateNode, t *parse.Tree, tp types.Type) {
+		}, warnFunc, allDeferred, pkgs)
+		if err != nil {
+			for _, line := range strings.Split(err.Error(), "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					diagnostics = append(diagnostics, line)
+				}
+			}
+		}
+		allDeferred = append(allDeferred, deferred...)
+	}
+
+	return diagnostics, nil
 }
