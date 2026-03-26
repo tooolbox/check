@@ -53,7 +53,7 @@ func resolveStringExpr(info *types.Info, files []*ast.File, expr ast.Expr, depth
 
 		// Variable: trace back to the defining assignment.
 		if v, ok := obj.(*types.Var); ok {
-			rhs, ok := findDefiningValue(info, v, files)
+			rhs, ok := FindDefiningValue(info, v, files)
 			if !ok {
 				return "", false
 			}
@@ -71,9 +71,9 @@ func resolveStringExpr(info *types.Info, files []*ast.File, expr ast.Expr, depth
 	return "", false
 }
 
-// findDefiningValue locates the RHS expression from the defining assignment
+// FindDefiningValue locates the RHS expression from the defining assignment
 // of the given variable (either := or var declarations).
-func findDefiningValue(info *types.Info, v *types.Var, files []*ast.File) (ast.Expr, bool) {
+func FindDefiningValue(info *types.Info, v *types.Var, files []*ast.File) (ast.Expr, bool) {
 	// Find the defining *ast.Ident for this variable.
 	var defIdent *ast.Ident
 	for ident, obj := range info.Defs {
@@ -133,10 +133,63 @@ func findDefiningValue(info *types.Info, v *types.Var, files []*ast.File) (ast.E
 	return result, found
 }
 
+// FindDefiningValueInBlock is like FindDefiningValue but searches within a
+// single AST block (e.g. a function body) rather than across files.
+func FindDefiningValueInBlock(info *types.Info, v *types.Var, block ast.Node) (ast.Expr, bool) {
+	var defIdent *ast.Ident
+	for ident, obj := range info.Defs {
+		if obj == v {
+			defIdent = ident
+			break
+		}
+	}
+	if defIdent == nil {
+		return nil, false
+	}
+
+	var result ast.Expr
+	var found bool
+	ast.Inspect(block, func(node ast.Node) bool {
+		if found {
+			return false
+		}
+		switch n := node.(type) {
+		case *ast.AssignStmt:
+			if n.Tok != token.DEFINE {
+				return true
+			}
+			for i, lhs := range n.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || ident != defIdent {
+					continue
+				}
+				if i < len(n.Rhs) {
+					result = n.Rhs[i]
+					found = true
+					return false
+				}
+			}
+		case *ast.ValueSpec:
+			for i, ident := range n.Names {
+				if ident != defIdent {
+					continue
+				}
+				if i < len(n.Values) {
+					result = n.Values[i]
+					found = true
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return result, found
+}
+
 // IsFuncParam reports whether the given expression is an identifier that
 // refers to a function parameter. If so, it returns the parameter index
 // (position in the function signature) and the types.Object for the
-// enclosing function.
+// enclosing function (or the variable a closure is assigned to).
 func IsFuncParam(info *types.Info, files []*ast.File, expr ast.Expr) (paramIdx int, funcObj types.Object, ok bool) {
 	ident, isIdent := expr.(*ast.Ident)
 	if !isIdent || info == nil {
@@ -151,29 +204,51 @@ func IsFuncParam(info *types.Info, files []*ast.File, expr ast.Expr) (paramIdx i
 		return -1, nil, false
 	}
 
-	// Find the enclosing FuncDecl and check if obj is one of its parameters.
+	// Try named function declarations first.
 	fd := findEnclosingFuncDecl(files, ident.Pos())
-	if fd == nil || fd.Type == nil || fd.Type.Params == nil {
-		return -1, nil, false
+	if fd != nil && fd.Type != nil && fd.Type.Params != nil {
+		idx := 0
+		for _, field := range fd.Type.Params.List {
+			for _, name := range field.Names {
+				defObj := info.Defs[name]
+				if defObj == v {
+					fObj := funcObjForDecl(info, fd)
+					if fObj == nil {
+						return -1, nil, false
+					}
+					return idx, fObj, true
+				}
+				idx++
+			}
+			if len(field.Names) == 0 {
+				idx++
+			}
+		}
 	}
 
-	idx := 0
-	for _, field := range fd.Type.Params.List {
-		for _, name := range field.Names {
-			defObj := info.Defs[name]
-			if defObj == v {
-				fObj := funcObjForDecl(info, fd)
-				if fObj == nil {
-					return -1, nil, false
+	// Try closure (FuncLit) — the closure may be assigned to a variable
+	// whose call sites the call-graph tracer can resolve.
+	fl := findEnclosingFuncLit(files, ident.Pos())
+	if fl != nil && fl.Type != nil && fl.Type.Params != nil {
+		idx := 0
+		for _, field := range fl.Type.Params.List {
+			for _, name := range field.Names {
+				defObj := info.Defs[name]
+				if defObj == v {
+					fObj := funcLitVarObj(info, files, fl)
+					if fObj == nil {
+						return -1, nil, false
+					}
+					return idx, fObj, true
 				}
-				return idx, fObj, true
+				idx++
 			}
-			idx++
-		}
-		if len(field.Names) == 0 {
-			idx++
+			if len(field.Names) == 0 {
+				idx++
+			}
 		}
 	}
+
 	return -1, nil, false
 }
 
@@ -188,6 +263,70 @@ func findEnclosingFuncDecl(files []*ast.File, pos token.Pos) *ast.FuncDecl {
 			if fd.Body.Pos() <= pos && pos <= fd.Body.End() {
 				return fd
 			}
+		}
+	}
+	return nil
+}
+
+// findEnclosingFuncLit returns the innermost FuncLit (closure) whose body
+// contains pos. It only returns FuncLits that are NOT inside a FuncDecl's
+// direct parameter list — i.e., it finds closures assigned to variables.
+func findEnclosingFuncLit(files []*ast.File, pos token.Pos) *ast.FuncLit {
+	var best *ast.FuncLit
+	for _, file := range files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			fl, ok := node.(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			if fl.Body != nil && fl.Body.Pos() <= pos && pos <= fl.Body.End() {
+				// Pick the innermost (most tightly enclosing) FuncLit.
+				if best == nil || fl.Body.Pos() > best.Body.Pos() {
+					best = fl
+				}
+			}
+			return true
+		})
+	}
+	return best
+}
+
+// funcLitVarObj finds the variable that a FuncLit is assigned to.
+// For example, given `render := func(...) { ... }`, it returns the
+// types.Object for `render`. Returns nil if the FuncLit is not
+// assigned to a named variable.
+func funcLitVarObj(info *types.Info, files []*ast.File, fl *ast.FuncLit) types.Object {
+	for _, file := range files {
+		var found types.Object
+		ast.Inspect(file, func(node ast.Node) bool {
+			if found != nil {
+				return false
+			}
+			switch n := node.(type) {
+			case *ast.AssignStmt:
+				if n.Tok != token.DEFINE {
+					return true
+				}
+				for i, rhs := range n.Rhs {
+					if rhs == fl && i < len(n.Lhs) {
+						if ident, ok := n.Lhs[i].(*ast.Ident); ok {
+							found = info.Defs[ident]
+						}
+						return false
+					}
+				}
+			case *ast.ValueSpec:
+				for i, val := range n.Values {
+					if val == fl && i < len(n.Names) {
+						found = info.Defs[n.Names[i]]
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if found != nil {
+			return found
 		}
 	}
 	return nil

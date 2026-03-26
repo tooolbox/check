@@ -102,7 +102,7 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 			return func(cat check.WarningCategory, pos token.Position, message string) {
 				_, _ = fmt.Fprintf(stderr, "%s: %s (%s)\n", pos, message, cat.Code())
 			}
-		}(), allDeferred)
+		}(), allDeferred, pkgs)
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			exitCode = 1
