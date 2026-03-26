@@ -623,6 +623,26 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 // checkCalls type-checks each pending ExecuteTemplate call against its
 // resolved template.
 func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types.Object]*resolvedTemplateSet, inspectCall ExecuteTemplateNodeInspectorFunc, inspectTemplate TemplateNodeInspectorFunc, warn PackageWarningFunc) error {
+	// Deduplicate warnings by (position, message) to avoid repeating the same
+	// warning for shared templates (e.g. nav.html) checked in multiple per-page
+	// template sets.
+	if warn != nil {
+		type warnKey struct {
+			pos string
+			msg string
+		}
+		seen := make(map[warnKey]bool)
+		origWarn := warn
+		warn = func(cat WarningCategory, pos token.Position, message string) {
+			k := warnKey{pos: pos.String(), msg: message}
+			if seen[k] {
+				return
+			}
+			seen[k] = true
+			origWarn(cat, pos, message)
+		}
+	}
+
 	mergedFunctions := make(Functions)
 	if pkg.Types != nil {
 		mergedFunctions = DefaultFunctions(pkg.Types)
@@ -669,6 +689,7 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 	subTemplateTypes := make(map[types.Object]map[string][]types.Type)
 
 	var errs []error
+	seenErrs := make(map[string]bool)
 	for _, p := range pending {
 		rts, ok := resolved[p.receiverObj]
 		if !ok {
@@ -713,10 +734,17 @@ func checkCalls(pkg *packages.Package, pending []pendingCall, resolved map[types
 			inspectCall(p.call, looked.Tree(), p.dataType)
 		}
 		if err := Execute(global, looked.Tree(), p.dataType); err != nil {
-			errs = append(errs, err)
+			errStr := err.Error()
+			if !seenErrs[errStr] {
+				seenErrs[errStr] = true
+				errs = append(errs, err)
+			}
 		}
 		// Merge sub-template call types collected during this Execute run.
-		if warn != nil {
+		// Skip for per-page scoped calls — each page legitimately passes a
+		// different type to shared sub-templates like {{template "content" .}},
+		// and each is already fully type-checked by Execute above.
+		if warn != nil && p.mapKey == "" {
 			byName := subTemplateTypes[p.receiverObj]
 			if byName == nil {
 				byName = make(map[string][]types.Type)
