@@ -228,14 +228,14 @@ func IsFuncParam(info *types.Info, files []*ast.File, expr ast.Expr) (paramIdx i
 
 	// Try closure (FuncLit) — the closure may be assigned to a variable
 	// whose call sites the call-graph tracer can resolve.
-	fl := findEnclosingFuncLit(files, ident.Pos())
+	fl := FindEnclosingFuncLit(files, ident.Pos())
 	if fl != nil && fl.Type != nil && fl.Type.Params != nil {
 		idx := 0
 		for _, field := range fl.Type.Params.List {
 			for _, name := range field.Names {
 				defObj := info.Defs[name]
 				if defObj == v {
-					fObj := funcLitVarObj(info, files, fl)
+					fObj := FuncLitVarObj(info, files, fl)
 					if fObj == nil {
 						return -1, nil, false
 					}
@@ -268,10 +268,10 @@ func findEnclosingFuncDecl(files []*ast.File, pos token.Pos) *ast.FuncDecl {
 	return nil
 }
 
-// findEnclosingFuncLit returns the innermost FuncLit (closure) whose body
+// FindEnclosingFuncLit returns the innermost FuncLit (closure) whose body
 // contains pos. It only returns FuncLits that are NOT inside a FuncDecl's
 // direct parameter list — i.e., it finds closures assigned to variables.
-func findEnclosingFuncLit(files []*ast.File, pos token.Pos) *ast.FuncLit {
+func FindEnclosingFuncLit(files []*ast.File, pos token.Pos) *ast.FuncLit {
 	var best *ast.FuncLit
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
@@ -291,11 +291,11 @@ func findEnclosingFuncLit(files []*ast.File, pos token.Pos) *ast.FuncLit {
 	return best
 }
 
-// funcLitVarObj finds the variable that a FuncLit is assigned to.
+// FuncLitVarObj finds the variable that a FuncLit is assigned to.
 // For example, given `render := func(...) { ... }`, it returns the
 // types.Object for `render`. Returns nil if the FuncLit is not
 // assigned to a named variable.
-func funcLitVarObj(info *types.Info, files []*ast.File, fl *ast.FuncLit) types.Object {
+func FuncLitVarObj(info *types.Info, files []*ast.File, fl *ast.FuncLit) types.Object {
 	for _, file := range files {
 		var found types.Object
 		ast.Inspect(file, func(node ast.Node) bool {

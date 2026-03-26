@@ -75,6 +75,24 @@ type SliceEvalContext struct {
 	depth            int
 }
 
+// WithBinding returns a copy of the context with an additional variable binding.
+// This is used for per-iteration evaluation, e.g. binding a range variable to
+// a specific value for one iteration of a for-range loop.
+func (ctx *SliceEvalContext) WithBinding(v *types.Var, value string) *SliceEvalContext {
+	newBindings := make(ParamBindings)
+	for k, val := range ctx.Bindings {
+		newBindings[k] = val
+	}
+	newBindings[v] = value
+	return &SliceEvalContext{
+		Info:             ctx.Info,
+		Files:            ctx.Files,
+		Block:            ctx.Block,
+		Bindings:         newBindings,
+		WorkingDirectory: ctx.WorkingDirectory,
+	}
+}
+
 const maxSliceEvalDepth = 15
 
 // ResolveStringSliceExpr evaluates an AST expression that produces a []string
@@ -278,6 +296,11 @@ func (ctx *SliceEvalContext) resolveFilepathDir(call *ast.CallExpr) ([]string, b
 		return nil, false
 	}
 	return []string{filepath.Dir(s)}, true
+}
+
+// ResolveString resolves a single AST expression to a string value.
+func (ctx *SliceEvalContext) ResolveString(expr ast.Expr) (string, bool) {
+	return ctx.resolveString(expr)
 }
 
 // resolveString resolves a single AST expression to a string value.
