@@ -67,7 +67,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			// Variable receiver — apply method to existing template.
 			switch sel.Sel.Name {
 			case "ParseFS":
-				filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver)
+				filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver, sliceCtx)
 				if err != nil {
 					return nil, lDelim, rDelim, err
 				}
@@ -147,7 +147,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			}
 			return NewTemplate(pkgPath, templateNames[0]), lDelim, rDelim, nil
 		case "ParseFS":
-			filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver)
+			filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver, sliceCtx)
 			if err != nil {
 				return nil, lDelim, rDelim, err
 			}
@@ -213,7 +213,7 @@ func EvaluateTemplateSelector(ts Template, pkg *types.Package, typesInfo *types.
 			}
 			return up.New(templateNames[0]), upLDelim, upRDelim, nil
 		case "ParseFS":
-			filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver)
+			filePaths, err := evaluateCallParseFilesArgs(workingDirectory, fileSet, call, files, embeddedPaths, typesInfo, embedFSResolver, sliceCtx)
 			if err != nil {
 				return nil, upLDelim, upRDelim, err
 			}
@@ -473,7 +473,7 @@ func evaluateFuncMap(workingDirectory string, typesInfo *types.Info, pkg *types.
 	return nil
 }
 
-func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, files []*ast.File, embeddedPaths []string, typesInfo *types.Info, embedFSResolver EmbedFSResolver) ([]string, error) {
+func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, files []*ast.File, embeddedPaths []string, typesInfo *types.Info, embedFSResolver EmbedFSResolver, sliceCtx *SliceEvalContext) ([]string, error) {
 	if len(call.Args) < 1 {
 		return nil, wrapWithFilename(workingDirectory, fileSet, call.Lparen, fmt.Errorf("missing required arguments"))
 	}
@@ -487,10 +487,18 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 	if sourceDir != "" {
 		joinDir = sourceDir
 	}
+
+	// Try string literals first.
 	templateNames, err := StringLiteralExpressionList(workingDirectory, fileSet, call.Args[1:])
 	if err != nil {
-		return nil, err
+		// Fall back to resolving non-literal args via SliceEvalContext
+		// (e.g. ParseFS(fsys, files...) where files is a []string variable).
+		templateNames, err = resolveParseFilesPatterns(workingDirectory, fileSet, call, sliceCtx)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	filtered := matches[:0]
 	for _, ef := range matches {
 		for j, pattern := range templateNames {
@@ -506,6 +514,33 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 		}
 	}
 	return joinFilePaths(joinDir, filtered...), nil
+}
+
+// resolveParseFilesPatterns resolves non-literal ParseFS pattern arguments
+// (e.g. a spread []string variable) via the SliceEvalContext.
+func resolveParseFilesPatterns(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, sliceCtx *SliceEvalContext) ([]string, error) {
+	if sliceCtx == nil {
+		return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[1].Pos(), fmt.Errorf("expected string literal got %s", astgen.Format(call.Args[1])))
+	}
+	patternArgs := call.Args[1:]
+	// Handle spread call: ParseFS(fsys, files...)
+	if call.Ellipsis.IsValid() && len(patternArgs) == 1 {
+		resolved, ok := ResolveStringSliceExpr(sliceCtx, patternArgs[0])
+		if !ok {
+			return nil, wrapWithFilename(workingDirectory, fileSet, patternArgs[0].Pos(), fmt.Errorf("could not resolve spread argument"))
+		}
+		return resolved, nil
+	}
+	// Handle individual non-literal args.
+	result := make([]string, 0, len(patternArgs))
+	for _, arg := range patternArgs {
+		s, ok := sliceCtx.resolveString(arg)
+		if !ok {
+			return nil, wrapWithFilename(workingDirectory, fileSet, arg.Pos(), fmt.Errorf("could not resolve argument"))
+		}
+		result = append(result, s)
+	}
+	return result, nil
 }
 
 func evaluateParseFilesArgs(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, sliceCtx *SliceEvalContext) ([]string, error) {
