@@ -450,6 +450,10 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 		return nil, []error{fmt.Errorf("failed to calculate relative path for embedded files: %w", err)}
 	}
 
+	// Build a resolver that traces fs.FS function parameters back through
+	// call sites across all packages to find the originating //go:embed var.
+	embedFSResolver := buildEmbedFSResolver(pkg, allPkgs)
+
 	var resolveErrs []error
 
 	resolveExpr := func(obj types.Object, name string, expr ast.Expr) {
@@ -487,7 +491,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 					perPageCtx := sliceCtx.WithBinding(storeInfo.rangeVar, pageFile)
 					perMeta := &asteval.TemplateMetadata{}
 					perFuncs := asteval.DefaultFunctions(pkg.Types)
-					perTS, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, perFuncs, make(map[string]any), perMeta, perPageCtx)
+					perTS, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, perFuncs, make(map[string]any), perMeta, perPageCtx, embedFSResolver)
 					if err != nil {
 						continue
 					}
@@ -512,7 +516,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 		// Standard single-set resolution (non-loop or fallback).
 		funcTypeMap := asteval.DefaultFunctions(pkg.Types)
 		meta := &asteval.TemplateMetadata{}
-		ts, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, funcTypeMap, make(map[string]any), meta, sliceCtx)
+		ts, _, _, err := asteval.EvaluateTemplateSelector(nil, pkg.Types, pkg.TypesInfo, expr, workingDirectory, name, "", "", pkg.Fset, pkg.Syntax, embeddedPaths, funcTypeMap, make(map[string]any), meta, sliceCtx, embedFSResolver)
 		if err != nil {
 			resolveErrs = append(resolveErrs, err)
 			return
@@ -606,7 +610,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 				return true
 			}
 			meta := &asteval.TemplateMetadata{}
-			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.single.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.single.functions, make(map[string]any), meta, nil)
+			ts, _, _, err := asteval.EvaluateTemplateSelector(rt.single.templates, pkg.Types, pkg.TypesInfo, call, workingDirectory, "", "", "", pkg.Fset, pkg.Syntax, embeddedPaths, rt.single.functions, make(map[string]any), meta, nil, embedFSResolver)
 			if err != nil {
 				return true
 			}
@@ -1684,4 +1688,119 @@ func parseLocation(loc string) token.Position {
 	}
 	pos.Filename = loc
 	return pos
+}
+
+// buildEmbedFSResolver creates an EmbedFSResolver that traces fs.FS function
+// parameters back through the call graph across all packages to find the
+// originating package-level var with a //go:embed directive.
+func buildEmbedFSResolver(pkg *packages.Package, allPkgs []*packages.Package) asteval.EmbedFSResolver {
+	// Pre-build call site indices for all packages.
+	type pkgContext struct {
+		pkg   *packages.Package
+		info  *types.Info
+		files []*ast.File
+		index map[types.Object][]*ast.CallExpr
+	}
+	var contexts []pkgContext
+	contexts = append(contexts, pkgContext{pkg, pkg.TypesInfo, pkg.Syntax, asteval.BuildCallSiteIndex(pkg.TypesInfo, pkg.Syntax)})
+	for _, p := range allPkgs {
+		if p.TypesInfo != pkg.TypesInfo && p.TypesInfo != nil {
+			contexts = append(contexts, pkgContext{p, p.TypesInfo, p.Syntax, asteval.BuildCallSiteIndex(p.TypesInfo, p.Syntax)})
+		}
+	}
+
+	// findEmbedForObj looks up the //go:embed directive for a types.Object
+	// that should be a package-level var, and returns the matched file paths
+	// and the working directory of the package that owns the var.
+	findEmbedForObj := func(obj types.Object) ([]string, string, bool) {
+		for _, ctx := range contexts {
+			if ctx.pkg.Types != obj.Pkg() {
+				continue
+			}
+			for _, decl := range astgen.IterateGenDecl(ctx.files, token.VAR) {
+				for _, s := range decl.Specs {
+					spec, ok := s.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for _, name := range spec.Names {
+						defObj := ctx.info.Defs[name]
+						if defObj != obj {
+							continue
+						}
+						var comment strings.Builder
+						asteval.ReadComments(&comment, decl.Doc, spec.Doc)
+						templateNames := asteval.ParseTemplateNames(comment.String())
+						if len(templateNames) == 0 {
+							return nil, "", false
+						}
+						dir := packageDirectory(ctx.pkg)
+						embedPaths, err := asteval.RelativeFilePaths(dir, ctx.pkg.EmbedFiles...)
+						if err != nil {
+							return nil, "", false
+						}
+						matched, err := asteval.EmbeddedFilesMatchingTemplateNameList(dir, ctx.pkg.Fset, decl, templateNames, embedPaths)
+						if err != nil {
+							return nil, "", false
+						}
+						return matched, dir, true
+					}
+				}
+			}
+			break
+		}
+		return nil, "", false
+	}
+
+	// resolveExprToEmbed traces an expression back through the call graph
+	// to find a package-level var with //go:embed. Returns the matched
+	// paths, the source package directory, and whether resolution succeeded.
+	var resolveExprToEmbed func(info *types.Info, files []*ast.File, expr ast.Expr, depth int) ([]string, string, bool)
+	resolveExprToEmbed = func(info *types.Info, files []*ast.File, expr ast.Expr, depth int) ([]string, string, bool) {
+		if depth > 5 {
+			return nil, "", false
+		}
+
+		switch e := expr.(type) {
+		case *ast.Ident:
+			obj := info.Uses[e]
+			if obj == nil {
+				return nil, "", false
+			}
+			if paths, dir, ok := findEmbedForObj(obj); ok {
+				return paths, dir, true
+			}
+			// Try as a function parameter — chase call sites.
+			paramIdx, funcObj, ok := asteval.IsFuncParam(info, files, expr)
+			if !ok {
+				return nil, "", false
+			}
+			for _, ctx := range contexts {
+				for _, cs := range ctx.index[funcObj] {
+					if paramIdx < len(cs.Args) {
+						if paths, dir, ok := resolveExprToEmbed(ctx.info, ctx.files, cs.Args[paramIdx], depth+1); ok {
+							return paths, dir, true
+						}
+					}
+				}
+			}
+		case *ast.SelectorExpr:
+			// Qualified identifier (e.g. beyond.TemplatesFS).
+			obj := info.Uses[e.Sel]
+			if obj == nil {
+				return nil, "", false
+			}
+			if paths, dir, ok := findEmbedForObj(obj); ok {
+				return paths, dir, true
+			}
+		}
+		return nil, "", false
+	}
+
+	return func(info *types.Info, files []*ast.File, fsIdent *ast.Ident) ([]string, string, error) {
+		if paths, dir, ok := resolveExprToEmbed(info, files, fsIdent, 0); ok {
+			return paths, dir, nil
+		}
+		return nil, "", nil
+	}
 }
