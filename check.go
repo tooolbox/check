@@ -187,6 +187,11 @@ func pipeFieldPath(pipe *parse.PipeNode) string {
 		return "."
 	case *parse.FieldNode:
 		return "." + strings.Join(n.Ident, ".")
+	case *parse.VariableNode:
+		// Handle $-prefixed paths like $.User → "$User"
+		if len(n.Ident) >= 2 && n.Ident[0] == "$" {
+			return "$" + strings.Join(n.Ident[1:], ".")
+		}
 	}
 	return ""
 }
@@ -264,6 +269,28 @@ func (s *scope) checkVariableNode(tree *parse.Tree, n *parse.VariableNode, args 
 		s.guarded["."] = struct{}{}
 		if !alreadyGuarded {
 			defer delete(s.guarded, ".")
+		}
+	}
+	// For $ references, translate $-prefixed guarded paths to .-prefixed
+	// form so checkIdentifiers can match them. For example, if {{if $.User}}
+	// guards "$User", translate to ".User" for the identifier chain check.
+	if n.Ident[0] == "$" {
+		var added []string
+		for path := range s.guarded {
+			if len(path) > 1 && path[0] == '$' {
+				dotPath := "." + path[1:]
+				if _, exists := s.guarded[dotPath]; !exists {
+					s.guarded[dotPath] = struct{}{}
+					added = append(added, dotPath)
+				}
+			}
+		}
+		if len(added) > 0 {
+			defer func() {
+				for _, p := range added {
+					delete(s.guarded, p)
+				}
+			}()
 		}
 	}
 	return s.checkIdentifiers(tree, tp, n, n.Ident[1:], args)
@@ -883,23 +910,29 @@ func (g *Global) fieldHasNonilTag(typ types.Type, fieldName string) bool {
 		_, nonil := fields[fieldName]
 		return nonil
 	}
-	// Scan direct fields for nonil tags and recurse into embedded structs.
+	// Scan ALL direct fields for nonil tags and recurse into embedded structs.
+	// Cache every tagged field so subsequent lookups for different field names
+	// on the same struct are cache hits.
 	fields := make(map[string]struct{})
 	for i := 0; i < st.NumFields(); i++ {
 		f := st.Field(i)
-		if f.Name() == fieldName {
-			if strings.Contains(st.Tag(i), `templatecheck:"nonil"`) {
-				fields[fieldName] = struct{}{}
-			}
+		if strings.Contains(st.Tag(i), `templatecheck:"nonil"`) {
+			fields[f.Name()] = struct{}{}
 		}
-		// Recurse into embedded (anonymous) structs.
+		// Recurse into embedded (anonymous) structs to find inherited tags.
 		if f.Anonymous() {
 			embeddedType := f.Type()
 			if ptr, ok := embeddedType.(*types.Pointer); ok {
 				embeddedType = ptr.Elem()
 			}
-			if g.fieldHasNonilTag(embeddedType, fieldName) {
-				fields[fieldName] = struct{}{}
+			if embSt, ok := embeddedType.Underlying().(*types.Struct); ok {
+				// Ensure embedded struct is scanned first.
+				g.fieldHasNonilTag(embeddedType, "")
+				if cached, ok := g.nonilFields[embSt]; ok {
+					for name := range cached {
+						fields[name] = struct{}{}
+					}
+				}
 			}
 		}
 	}
