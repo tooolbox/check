@@ -18,6 +18,8 @@ Flags:
 - `-w` &mdash; enable warnings for potential issues (see [Warnings](#warnings) below)
 - `-C dir` &mdash; change working directory before loading packages
 - `-o format` &mdash; output format: `tsv` (default) or `jsonl`
+- `--mcp` &mdash; run as an [MCP](https://modelcontextprotocol.io/) server over stdio (for AI agent integration)
+- `--version` &mdash; print version and exit
 
 ### How the CLI discovers templates
 
@@ -25,7 +27,7 @@ The CLI works by statically analyzing your Go source code. It traces each `Execu
 
 1. **`ExecuteTemplate` must use a string literal** for the template name (second argument). Calls that pass a variable or expression will produce a warning (with `-w`) and be skipped. **`Execute`** calls are also supported &mdash; the template name is inferred from the receiver's root template.
 
-2. **Template initialization must use static arguments.** File paths passed to `ParseFiles`, glob patterns passed to `ParseGlob`, and embed patterns passed to `ParseFS` must all be string literals.
+2. **Template initialization works best with static arguments.** File paths passed to `ParseFiles`, glob patterns passed to `ParseGlob`, and embed patterns passed to `ParseFS` are ideally string literals. However, the tool can also trace `embed.FS` variables through function parameters across packages, resolve `fs.Glob` calls against embedded file lists, and handle spread `[]string` variables and per-page template map construction.
 
 3. **Supported initialization patterns:**
    - `template.Must(template.ParseFiles("a.html", "b.html"))`
@@ -41,7 +43,7 @@ The `-w` flag enables warnings for issues that are not type errors but may indic
 
 ### Unguarded pointer dereference
 
-When dot is a pointer type (e.g. `*Page`), accessing a field like `.Title` will panic at runtime if dot is nil. The tool warns unless the access is guarded by `{{with}}` or `{{if}}`.
+When dot is a pointer type (e.g. `*Page`), accessing a field like `.Title` will panic at runtime if dot is nil. The tool warns unless the access is guarded by `{{with}}`, `{{if}}`, or the `and` short-circuit pattern.
 
 ```go
 type Page struct { Title string }
@@ -69,6 +71,29 @@ func render(p *Page) {
   {{.Title}}
 {{end}}
 ```
+
+**OK** &mdash; guarded with `and` short-circuit (Go's `and` returns the first falsy value without evaluating the rest):
+```
+{{if and .User (eq .User.Role "admin")}}
+  {{.User.Username}}
+{{end}}
+```
+
+Guards also work through `$` references (`$.User`), sub-template calls (`{{template "nav" .}}`), and inside `{{range}}` blocks.
+
+#### `templatecheck:"nonil"` struct tag
+
+For pointer-typed struct fields that are always initialized before being passed to a template, you can suppress W003 with a struct tag:
+
+```go
+type PageData struct {
+    Title string
+    S     *Strings     `templatecheck:"nonil"`
+    User  *models.User `templatecheck:"nonil"`
+}
+```
+
+The tag is respected for direct access (`.S.AppName`), variable assignment (`$s := .S` then `$s.AppName`), `$` references (`$.User.Role`), and embedded structs.
 
 ### Interface field access
 
@@ -208,4 +233,4 @@ Call `Execute` with a `types.Type` for the template's data (`.`) and the templat
 1. You must provide a `types.Type` for the template's root context (`.`).
 2. No support for third-party template packages (e.g. [safehtml](https://pkg.go.dev/github.com/google/safehtml)).
 3. Cannot detect runtime conditions such as out-of-range indexes or errors from boxed types.
-4. Template initialization must use static arguments — file paths, glob patterns, and embed patterns must be string literals (see [How the CLI discovers templates](#how-the-cli-discovers-templates)).
+4. Template initialization generally requires static arguments, but the tool can trace `embed.FS` variables through function parameters across packages and resolve `fs.Glob` patterns against embedded file lists. Dynamically constructed file lists that cannot be statically resolved are skipped gracefully.

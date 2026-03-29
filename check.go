@@ -188,12 +188,38 @@ func pipeFieldPath(pipe *parse.PipeNode) string {
 	case *parse.FieldNode:
 		return "." + strings.Join(n.Ident, ".")
 	case *parse.VariableNode:
-		// Handle $-prefixed paths like $.User → "$User"
+		// Handle $-prefixed paths like $.User → "$.User"
 		if len(n.Ident) >= 2 && n.Ident[0] == "$" {
-			return "$" + strings.Join(n.Ident[1:], ".")
+			return "$." + strings.Join(n.Ident[1:], ".")
 		}
 	}
 	return ""
+}
+
+// pipeAndGuardPaths extracts guard paths from "and" chains in a pipe.
+// For {{if and .User (eq .User.Role "admin")}}, returns [".User"].
+// All bare variable/field arguments in the and chain contribute paths.
+func pipeAndGuardPaths(pipe *parse.PipeNode) []string {
+	if pipe == nil || len(pipe.Cmds) != 1 {
+		return nil
+	}
+	cmd := pipe.Cmds[0]
+	if len(cmd.Args) < 3 {
+		return nil
+	}
+	// Check if the first arg is the "and" identifier.
+	ident, ok := cmd.Args[0].(*parse.IdentifierNode)
+	if !ok || ident.Ident != "and" {
+		return nil
+	}
+	// Collect guard paths from all arguments (the bare references).
+	var paths []string
+	for _, arg := range cmd.Args[1:] {
+		if p := nodeGuardPath(arg); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 func (s *scope) walk(tree *parse.Tree, dot, prev types.Type, node parse.Node) (types.Type, error) {
@@ -271,14 +297,14 @@ func (s *scope) checkVariableNode(tree *parse.Tree, n *parse.VariableNode, args 
 			defer delete(s.guarded, ".")
 		}
 	}
-	// For $ references, translate $-prefixed guarded paths to .-prefixed
+	// For $ references, translate $.-prefixed guarded paths to .-prefixed
 	// form so checkIdentifiers can match them. For example, if {{if $.User}}
-	// guards "$User", translate to ".User" for the identifier chain check.
+	// guards "$.User", translate to ".User" for the identifier chain check.
 	if n.Ident[0] == "$" {
 		var added []string
 		for path := range s.guarded {
-			if len(path) > 1 && path[0] == '$' {
-				dotPath := "." + path[1:]
+			if strings.HasPrefix(path, "$.") {
+				dotPath := path[1:] // "$.User" → ".User"
 				if _, exists := s.guarded[dotPath]; !exists {
 					s.guarded[dotPath] = struct{}{}
 					added = append(added, dotPath)
@@ -373,6 +399,16 @@ func (s *scope) checkIfNode(tree *parse.Tree, dot types.Type, n *parse.IfNode) e
 	ifScope := s.child()
 	if path := pipeFieldPath(n.Pipe); path != "" {
 		ifScope.guarded[path] = struct{}{}
+	}
+	// Extract additional guard paths from "and" chains in the pipe.
+	for _, path := range pipeAndGuardPaths(n.Pipe) {
+		if strings.HasPrefix(path, "$") && !strings.Contains(path, ".") {
+			// Bare variable like "$u" — mark as nonil so checkVariableNode
+			// guards the first pointer deref.
+			ifScope.nonilVars[path] = struct{}{}
+		} else {
+			ifScope.guarded[path] = struct{}{}
+		}
 	}
 	if _, err := ifScope.walk(tree, dot, nil, n.List); err != nil {
 		return err
@@ -546,7 +582,13 @@ func (s *scope) checkCommandNode(tree *parse.Tree, dot, prev types.Type, cmd *pa
 		}
 		return s.checkChainNode(tree, dot, prev, n, argTypes)
 	case *parse.IdentifierNode:
-		argTypes, err := s.argumentTypes(tree, dot, prev, cmd.Args[1:])
+		var argTypes []types.Type
+		var err error
+		if n.Ident == "and" {
+			argTypes, err = s.argumentTypesAnd(tree, dot, prev, cmd.Args[1:])
+		} else {
+			argTypes, err = s.argumentTypes(tree, dot, prev, cmd.Args[1:])
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -586,6 +628,73 @@ func (s *scope) checkCommandNode(tree *parse.Tree, dot, prev types.Type, cmd *pa
 	default:
 		return nil, newError(tree, first, "can't evaluate command %q", first)
 	}
+}
+
+// argumentTypesAnd evaluates arguments to the built-in "and" function
+// left-to-right, propagating nil-safety from earlier arguments to later
+// ones. If argument N is a bare variable or field reference to a pointer
+// type, arguments N+1..last are evaluated with that path guarded,
+// because Go's template "and" short-circuits on the first falsy value.
+func (s *scope) argumentTypesAnd(tree *parse.Tree, dot types.Type, prev types.Type, args []parse.Node) ([]types.Type, error) {
+	argTypes := make([]types.Type, 0, len(args)+1)
+	var addedGuards []string
+	var addedNonilVars []string
+	defer func() {
+		for _, g := range addedGuards {
+			delete(s.guarded, g)
+		}
+		for _, v := range addedNonilVars {
+			delete(s.nonilVars, v)
+		}
+	}()
+	for _, arg := range args {
+		argType, err := s.walk(tree, dot, prev, arg)
+		if err != nil {
+			return nil, err
+		}
+		argTypes = append(argTypes, argType)
+		// If this argument is a bare variable/field reference to a pointer
+		// type, guard it for subsequent arguments.
+		if path := nodeGuardPath(arg); path != "" {
+			if strings.HasPrefix(path, "$") && !strings.Contains(path, ".") {
+				// Bare variable like "$u" — mark as nonil.
+				if _, already := s.nonilVars[path]; !already {
+					s.nonilVars[path] = struct{}{}
+					addedNonilVars = append(addedNonilVars, path)
+				}
+			} else if _, already := s.guarded[path]; !already {
+				s.guarded[path] = struct{}{}
+				addedGuards = append(addedGuards, path)
+			}
+		}
+	}
+	if prev != nil {
+		argTypes = append(argTypes, prev)
+	}
+	return argTypes, nil
+}
+
+// nodeGuardPath extracts a guardable path from a parse node, if the node
+// is a bare variable or field reference. Returns "" if the node is not
+// a simple reference that can serve as a nil guard.
+func nodeGuardPath(node parse.Node) string {
+	switch n := node.(type) {
+	case *parse.FieldNode:
+		return "." + strings.Join(n.Ident, ".")
+	case *parse.VariableNode:
+		if len(n.Ident) >= 2 && n.Ident[0] == "$" {
+			// $.User → "$." prefix to distinguish from bare variable $u
+			return "$." + strings.Join(n.Ident[1:], ".")
+		}
+		if len(n.Ident) == 1 {
+			return n.Ident[0] // bare variable like "$u"
+		}
+	case *parse.CommandNode:
+		if len(n.Args) == 1 {
+			return nodeGuardPath(n.Args[0])
+		}
+	}
+	return ""
 }
 
 func (s *scope) argumentTypes(tree *parse.Tree, dot types.Type, prev types.Type, args []parse.Node) ([]types.Type, error) {
