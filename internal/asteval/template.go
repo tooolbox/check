@@ -499,6 +499,13 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 		}
 	}
 
+	// If no pattern arguments could be resolved, skip filtering and return
+	// all embedded files. This is conservative but avoids false positives
+	// for dynamically-constructed pattern lists.
+	if len(templateNames) == 0 {
+		return joinFilePaths(joinDir, matches...), nil
+	}
+
 	filtered := matches[:0]
 	for _, ef := range matches {
 		for j, pattern := range templateNames {
@@ -518,16 +525,19 @@ func evaluateCallParseFilesArgs(workingDirectory string, fileSet *token.FileSet,
 
 // resolveParseFilesPatterns resolves non-literal ParseFS pattern arguments
 // (e.g. a spread []string variable) via the SliceEvalContext.
+// resolveParseFilesPatterns resolves non-literal ParseFS pattern arguments
+// (e.g. a spread []string variable) via the SliceEvalContext. Returns nil, nil
+// when resolution is not possible (caller should skip filtering).
 func resolveParseFilesPatterns(workingDirectory string, fileSet *token.FileSet, call *ast.CallExpr, sliceCtx *SliceEvalContext) ([]string, error) {
 	if sliceCtx == nil {
-		return nil, wrapWithFilename(workingDirectory, fileSet, call.Args[1].Pos(), fmt.Errorf("expected string literal got %s", astgen.Format(call.Args[1])))
+		return nil, nil
 	}
 	patternArgs := call.Args[1:]
 	// Handle spread call: ParseFS(fsys, files...)
 	if call.Ellipsis.IsValid() && len(patternArgs) == 1 {
 		resolved, ok := ResolveStringSliceExpr(sliceCtx, patternArgs[0])
 		if !ok {
-			return nil, wrapWithFilename(workingDirectory, fileSet, patternArgs[0].Pos(), fmt.Errorf("could not resolve spread argument"))
+			return nil, nil
 		}
 		return resolved, nil
 	}
@@ -536,7 +546,7 @@ func resolveParseFilesPatterns(workingDirectory string, fileSet *token.FileSet, 
 	for _, arg := range patternArgs {
 		s, ok := sliceCtx.resolveString(arg)
 		if !ok {
-			return nil, wrapWithFilename(workingDirectory, fileSet, arg.Pos(), fmt.Errorf("could not resolve argument"))
+			return nil, nil
 		}
 		result = append(result, s)
 	}

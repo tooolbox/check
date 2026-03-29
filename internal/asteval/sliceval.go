@@ -150,13 +150,14 @@ func (ctx *SliceEvalContext) resolveIdentSlice(ident *ast.Ident) ([]string, bool
 
 	// Trace variable to its defining expression.
 	var defExpr ast.Expr
+	var found bool
 	if ctx.Block != nil {
-		defExpr, ok = FindDefiningValueInBlock(ctx.Info, v, ctx.Block)
+		defExpr, found = FindDefiningValueInBlock(ctx.Info, v, ctx.Block)
 	}
-	if !ok {
-		defExpr, ok = FindDefiningValue(ctx.Info, v, ctx.Files)
+	if !found {
+		defExpr, found = FindDefiningValue(ctx.Info, v, ctx.Files)
 	}
-	if !ok {
+	if !found {
 		return nil, false
 	}
 
