@@ -454,6 +454,7 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 	// call sites across all packages to find the originating //go:embed var.
 	embedFSResolver := buildEmbedFSResolver(pkg, allPkgs)
 
+
 	var resolveErrs []error
 
 	resolveExpr := func(obj types.Object, name string, expr ast.Expr) {
@@ -478,6 +479,12 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 			}
 		}
 
+		// Provide the embed resolver for fs.Glob resolution so it can
+		// trace fs.FS parameters to their //go:embed paths on demand.
+		if sliceCtx.EmbedResolver == nil {
+			sliceCtx.EmbedResolver = embedFSResolver
+		}
+
 		// Only attempt resolution if the expression is a call. Non-call
 		// expressions (e.g. unresolved map lookups, function returns that
 		// couldn't be traced) are silently skipped — the receiver simply
@@ -495,7 +502,10 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 			if ok && len(pageFiles) > 0 {
 				byKey := make(map[string]*resolvedTemplate)
 				for _, pageFile := range pageFiles {
-					if !filepath.IsAbs(pageFile) {
+					// Only make paths absolute if they use OS separators
+					// (from filepath.Glob). Paths with forward slashes come
+					// from fs.Glob/embed.FS and should stay relative.
+					if !filepath.IsAbs(pageFile) && !strings.Contains(pageFile, "/") {
 						pageFile = filepath.Join(sliceCtx.WorkingDirectory, pageFile)
 					}
 					perPageCtx := sliceCtx.WithBinding(storeInfo.rangeVar, pageFile)

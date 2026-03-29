@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	posixPath "path"
 	"path/filepath"
 	"strconv"
 )
@@ -72,6 +73,8 @@ type SliceEvalContext struct {
 	Block            ast.Node // scoped block (e.g. function body) for local var lookups
 	Bindings         ParamBindings
 	WorkingDirectory string
+	EmbeddedPaths    []string         // relative paths of embedded files (for fs.Glob resolution)
+	EmbedResolver    EmbedFSResolver  // optional resolver for cross-package fs.FS tracing
 	depth            int
 }
 
@@ -90,6 +93,8 @@ func (ctx *SliceEvalContext) WithBinding(v *types.Var, value string) *SliceEvalC
 		Block:            ctx.Block,
 		Bindings:         newBindings,
 		WorkingDirectory: ctx.WorkingDirectory,
+		EmbeddedPaths:    ctx.EmbeddedPaths,
+		EmbedResolver:    ctx.EmbedResolver,
 	}
 }
 
@@ -205,6 +210,12 @@ func (ctx *SliceEvalContext) resolveCallSlice(call *ast.CallExpr) ([]string, boo
 		return ctx.resolveFilepathBase(call)
 	case pkgPath == "path/filepath" && funcName == "Dir":
 		return ctx.resolveFilepathDir(call)
+	case pkgPath == "path" && funcName == "Base":
+		return ctx.resolvePathBase(call)
+	case pkgPath == "path" && funcName == "Dir":
+		return ctx.resolvePathDir(call)
+	case pkgPath == "io/fs" && funcName == "Glob":
+		return ctx.resolveFSGlob(call)
 	}
 
 	return nil, false
@@ -275,6 +286,49 @@ func (ctx *SliceEvalContext) resolveFilepathGlob(call *ast.CallExpr) ([]string, 
 	return matches, true
 }
 
+// resolveFSGlob handles fs.Glob(fsys, pattern) by matching the pattern
+// against the embedded file paths stored in the context.
+func (ctx *SliceEvalContext) resolveFSGlob(call *ast.CallExpr) ([]string, bool) {
+	if len(call.Args) != 2 {
+		return nil, false
+	}
+	pattern, ok := ctx.resolveString(call.Args[1])
+	if !ok {
+		return nil, false
+	}
+
+	// Get the embedded file paths to glob against. First try the context's
+	// pre-populated paths. If empty, try resolving the fs.FS argument
+	// (first arg) via the embed resolver to get the right package's paths.
+	embeddedPaths := ctx.EmbeddedPaths
+	if len(embeddedPaths) == 0 && ctx.EmbedResolver != nil {
+		if fsIdent, ok := call.Args[0].(*ast.Ident); ok {
+			paths, _, err := ctx.EmbedResolver(ctx.Info, ctx.Files, fsIdent)
+			if err == nil && len(paths) > 0 {
+				embeddedPaths = paths
+			}
+		}
+	}
+	if len(embeddedPaths) == 0 {
+		return nil, false
+	}
+
+	// embed.FS uses forward slashes; match and return with forward slashes
+	// so that path.Base/path.Dir work correctly downstream.
+	var matches []string
+	for _, ep := range embeddedPaths {
+		epSlash := filepath.ToSlash(ep)
+		matched, err := filepath.Match(pattern, epSlash)
+		if err != nil {
+			return nil, false
+		}
+		if matched {
+			matches = append(matches, epSlash)
+		}
+	}
+	return matches, true
+}
+
 // resolveFilepathBase handles filepath.Base(path) → single string.
 func (ctx *SliceEvalContext) resolveFilepathBase(call *ast.CallExpr) ([]string, bool) {
 	if len(call.Args) != 1 {
@@ -297,6 +351,30 @@ func (ctx *SliceEvalContext) resolveFilepathDir(call *ast.CallExpr) ([]string, b
 		return nil, false
 	}
 	return []string{filepath.Dir(s)}, true
+}
+
+// resolvePathBase handles path.Base(p) → single string (forward slashes).
+func (ctx *SliceEvalContext) resolvePathBase(call *ast.CallExpr) ([]string, bool) {
+	if len(call.Args) != 1 {
+		return nil, false
+	}
+	s, ok := ctx.resolveString(call.Args[0])
+	if !ok {
+		return nil, false
+	}
+	return []string{posixPath.Base(s)}, true
+}
+
+// resolvePathDir handles path.Dir(p) → single string (forward slashes).
+func (ctx *SliceEvalContext) resolvePathDir(call *ast.CallExpr) ([]string, bool) {
+	if len(call.Args) != 1 {
+		return nil, false
+	}
+	s, ok := ctx.resolveString(call.Args[0])
+	if !ok {
+		return nil, false
+	}
+	return []string{posixPath.Dir(s)}, true
 }
 
 // ResolveString resolves a single AST expression to a string value.
