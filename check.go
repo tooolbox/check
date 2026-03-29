@@ -260,8 +260,11 @@ func (s *scope) checkVariableNode(tree *parse.Tree, n *parse.VariableNode, args 
 	// struct tag), temporarily guard "." so the first pointer deref in
 	// the identifier chain is not flagged as W003.
 	if _, nonil := s.nonilVars[n.Ident[0]]; nonil {
+		_, alreadyGuarded := s.guarded["."]
 		s.guarded["."] = struct{}{}
-		defer delete(s.guarded, ".")
+		if !alreadyGuarded {
+			defer delete(s.guarded, ".")
+		}
 	}
 	return s.checkIdentifiers(tree, tp, n, n.Ident[1:], args)
 }
@@ -450,12 +453,19 @@ func (s *scope) checkTemplateNode(tree *parse.Tree, dot types.Type, n *parse.Tem
 	if !ok {
 		return newError(tree, n, "template %q not found", n.Name)
 	}
+	childGuarded := make(map[string]struct{})
+	// If dot is known non-nil in the current scope (e.g. inside a {{with}}
+	// block), propagate that to the child template since the same value
+	// is being passed as the child's dot.
+	if _, dotGuarded := s.guarded["."]; dotGuarded {
+		childGuarded["."] = struct{}{}
+	}
 	childScope := scope{
 		global: s.global,
 		variables: map[string]types.Type{
 			"$": x,
 		},
-		guarded:   make(map[string]struct{}),
+		guarded:   childGuarded,
 		nonilVars: make(map[string]struct{}),
 		declared:  make(map[string]parse.Node),
 		used:      make(map[string]struct{}),
