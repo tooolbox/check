@@ -468,6 +468,16 @@ func resolveTemplates(pkg *packages.Package, receivers map[types.Object]struct{}
 		expr, sliceCtx, storeInfo = traceMapIndex(pkg.TypesInfo, pkg.Syntax, expr, workingDirectory, moduleRoot, allPkgs)
 		_ = storeInfo // used later for per-key template resolution
 
+		// Ensure a SliceEvalContext exists so that non-literal ParseFS
+		// pattern arguments (e.g. spread []string vars) can be resolved.
+		if sliceCtx == nil {
+			sliceCtx = &asteval.SliceEvalContext{
+				Info:             pkg.TypesInfo,
+				Files:            pkg.Syntax,
+				WorkingDirectory: workingDirectory,
+			}
+		}
+
 		// Only attempt resolution if the expression is a call. Non-call
 		// expressions (e.g. unresolved map lookups, function returns that
 		// couldn't be traced) are silently skipped — the receiver simply
