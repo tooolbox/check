@@ -52,6 +52,13 @@ func run(dir string, args []string, stdout, stderr io.Writer) int {
 	flagSet.BoolVar(&warn, "w", false, "enable warnings (e.g. unguarded pointer access, unused templates)")
 	flagSet.StringVar(&dir, "C", dir, "change directory")
 	flagSet.StringVar(&outputFormat, "o", "tsv", "output format: tsv or jsonl")
+	flagSet.Usage = func() {
+		fmt.Fprintf(flagSet.Output(), "Usage: check-templates [flags] [packages]\n\nFlags:\n")
+		flagSet.PrintDefaults()
+		fmt.Fprintf(flagSet.Output(), "\nSpecial flags (must be the only argument):\n")
+		fmt.Fprintf(flagSet.Output(), "  --mcp\n\trun as MCP (Model Context Protocol) server over stdio\n")
+		fmt.Fprintf(flagSet.Output(), "  --version\n\tprint version and exit\n")
+	}
 	if err := flagSet.Parse(args); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
